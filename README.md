@@ -16,14 +16,6 @@ The repository evaluates two core algorithmic families across communicating and 
 
 DRACO does not attempt to "beat" the Clark-Scarf optimum. Instead, it tackles the reality of deployment: classical base-stock policies must commit to a single inventory level across an unknown demand distribution, making them badly suboptimal under regime uncertainty. DRACO leverages context-based meta-RL (BAMDP) to infer the current demand regime and adapt its order-up-to levels dynamically, crushing the best regime-agnostic fixed base-stock policy while isolating the true marginal value of inter-agent communication.
 
-## Communication Protocols
-
-To address information asymmetry across independent supply chain entities, communicating variants (comm_qmix and comm_mappo) incorporate a differentiable, continuous-to-categorical communication channel via discrete vocabulary layers.
-
-    Channel Capacity Controls (vocab_size): Evaluates structural bottlenecks across variable codebooks (1, 3, or 5 tokens). A vocabulary size of 1 explicitly maps to a zero-information channel, acting as an architectural ablation control.
-
-    Regularization (L2​ Penalty): Employs an internal differentiable message magnitude penalty (λ∑m2) to counteract token collapse and discourage spamming uninformative signals across the channel.
-
 ## File Structure
 
 ```
@@ -39,7 +31,7 @@ To address information asymmetry across independent supply chain entities, commu
 └── requirements.txt               # Complete Python system and training dependencies
 ```
 
-### Theoretical Backbone
+## Theoretical Backbone
 
 | Result | Reference | Role in the Paper |
 | :--- | :--- | :--- |
@@ -53,7 +45,7 @@ To address information asymmetry across independent supply chain entities, commu
 
 ## Planned study
 
-# Study 1 — C1: regime inference (the spine)
+### Study 1 — C1: regime inference (the spine)
 
     Train: DRACO (no-comm) on the demand-randomization curriculum (λ ~ U[lo,hi] per episode + occasional within-episode shift).
     Eval (the key table): a held-out set of stationary λ ∈ {6, 10, 14, 18, 22} (per-episode constant, unknown to the agent), scored against (a) best single fixed S, (b) per-λ oracle, (c) Sterman.
@@ -62,7 +54,7 @@ To address information asymmetry across independent supply chain entities, commu
     Ablation (folds in point 1's comm-null): within Study 1, add neighbor-comm as one arm and show Δcost ≈ 0 vs no-comm (H4).
 
 
-# Study 2 — C2: value-of-communication topology sweep
+### Study 2 — C2: value-of-communication topology sweep
 
     Manipulation: topology ∈ {no-comm, neighbor, skip-level, full} × demand stochasticity ∈ {stationary in-support, non-stationary (within-episode shifts), shock (black_swan/extreme_chaos)}.
     Message: fixed content = sender's d̂ (Section 5).
@@ -71,7 +63,7 @@ To address information asymmetry across independent supply chain entities, commu
     Diagnostic (explains the sign): message-informativeness probe — does the shared d̂ reduce upstream forecast error vs forecasting from local orders? If comm helps, this must move; if it doesn't, that is the explanation for the null.
 
 
-# Study 3 — C3: symbolic distillation
+### Study 3 — C3: symbolic distillation
 
     Winner: the best Study-1 DRACO (the regime-adaptive policy).
     Distill: PySR over (belief/observed features) → effective order-up-to level S, per stage. Expect to recover something close to lead·d̂ + safety with small corrections.
