@@ -1,0 +1,86 @@
+# conf/agent/draco_v4.yaml
+# DRACO v4 -- single self-contained agent. Select with `defaults: - agent: draco_v4`.
+# All three debugged fixes are baked into the defaults below.
+algorithm: draco_v4
+
+# ===================== BAMDP belief (recurrent) =====================
+encoder_type: gru
+z_dim: 8
+kl_coef: 1.0e-3            # ELBO KL-to-prior weight
+pred_coef: 1.0            # ELBO demand-reconstruction weight ([FIX 3]: target is RAW demand)
+belief_sample: false
+use_context: true
+
+# ===================== actor head =====================
+# mlp = the head proven to learn for H1. switch to 'structured' once v4 is confirmed
+# learning, for the interpretable level-tracking experiments (H3/H4).
+actor_head: mlp
+lead_init: 4.0
+demand_init: 8.0
+corr_scale: 6.0
+demand_aux_coef: 0.05
+s_smooth_coef: 0.0
+s_bias_init: 40.0
+s_logstd_init: 0.7
+
+# ===================== communication (DIAL) =====================
+use_comm: true
+msg_dim: 4
+msg_penalty_coef: 0.0
+entropy_coef: 0.01
+
+# ===================== belief-conditioned distributional critic =====================
+critic_uses_belief: true
+n_quantiles: 32
+
+# --- NEW: Explicitly declare the v4 architecture flags ---
+structured_head: true   # default to the structured head
+order_cap_coef: 0.0     # default safety valve off
+corr_l2_coef: 0.0       # default safety valve off
+
+# ===================== risk OFF by default =====================
+risk_eta: 0.0
+cvar_alpha: 0.2
+
+# ===================== SRDQN per-agent shaping =====================
+srdqn_beta: 0.5
+# [FIX 1] reward_scale keeps the value target in the critic's reachable range.
+# With raw cost ~9/step over a 50-step horizon, scale 50 -> lambda-return ~ -35,
+# the range at which the critic was observed to TRACK in probes. Do NOT set this to 1
+# (target ~ -1800, the critic never reaches it -> uniformly negative advantages ->
+# frozen actor) and do NOT leave it at 100 (target too small, weak gradient).
+reward_scale: 50.0
+
+# ===================== PPO / optimisation =====================
+gamma: 0.99
+gae_lambda: 0.95
+k_epochs: 4
+critic_epochs: 8          # [FIX 2 support] train the critic harder so V tracks the
+                          # lambda-return target quickly (= more critic steps/update)
+eps_clip: 0.2
+max_grad_norm: 0.5
+lr_actor: 3.0e-4
+lr_msg: 3.0e-4
+lr_critic: 1.0e-3
+lr_encoder: 1.0e-3        # raised so the belief encodes demand fast (supports [FIX 3])
+polyak_tau: 0.005
+hidden_dim: 128
+
+# ===================== training schedule =====================
+batch_episodes: 32
+warm_up_episodes: 0
+patience: 3000
+lr_scheduler_step: 2000
+lr_scheduler_gamma: 0.5
+trace_every: 0
+
+# ===================== demand-randomisation curriculum = p(T) =====================
+dr_lambda_lo: 6.0
+dr_lambda_hi: 20.0
+dr_p_shift: 0.4
+dr_shift_scale: 2.5
+
+# ===================== in-training evaluation =====================
+eval_every: 50
+eval_episodes: 5
+ood_eval_type: black_swan

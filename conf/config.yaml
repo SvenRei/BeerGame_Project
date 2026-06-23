@@ -1,0 +1,102 @@
+# ==============================================================================
+# MASTER HYDRA CONFIGURATION
+# ==============================================================================
+# The defaults block instructs Hydra to compose the config dynamically.
+defaults:
+  # Look in the 'agent' folder and load 'qmix.yaml' by default.
+  - agent: draco_v4
+  # Load this master file itself.
+  - _self_
+
+# Global project name for Weights & Biases logging.
+project_name: "beer_game_marl"
+# Global random seed for reproducibility of environments and networks.
+seed: 42
+# Absolute maximum number of training episodes before forced termination.
+total_episodes: 15000
+
+# ==============================================================================
+# Global Supply Chain Environment Settings
+# ==============================================================================
+env:
+  # Number of weeks in a single episode.
+  horizon: 50
+  # Absolute physical limit on units an agent can order per step.
+  max_order: 100
+  # Penalty per unit of overstock inventory per week.
+  holding_cost: 0.5
+  # Penalty per unit of starving backlog per week.
+  backorder_cost: 1.0
+  # How many in-transit shipment slots the OBSERVATION exposes. Should be >= the
+  # largest shipping lead time below, or agents go briefly blind to inbound goods
+  # (the env warns if not). Changing this changes obs_dim -> retrain required.
+  #lookahead: 0
+  # End-consumer demand process: poisson | step | zero | black_swan | extreme_chaos.
+  demand_type: "poisson"
+
+  # --------------------------------------------------------------------------
+  # LEAD TIMES  (all OPTIONAL; every default reproduces the original constants,
+  # so omitting this whole block == the old environment exactly. Prior
+  # checkpoints/runs stay valid.)
+  #
+  # Each delay is either FIXED (an int) or a RANDOM RANGE ([lo, hi], sampled
+  # i.i.d. per shipment from lo..hi inclusive). If a *_range key is present it
+  # wins; otherwise the fixed key is used; otherwise the legacy default applies.
+  # HARD LIMIT: every max delay must be <= 15 (the pipeline horizon the critic's
+  # global state exposes) or the env raises at construction.
+  #
+  # The three physical delays:
+  #   ORDER       — time for an agent's ORDER to reach its supplier (info delay up).
+  #   SHIPPING    — time for fulfilled GOODS to travel down to the customer.
+  #   PRODUCTION  — time the manufacturer takes to PRODUCE before shipping.
+  # --------------------------------------------------------------------------
+
+  # ORDER lead time for retailer/wholesaler/distributor (legacy default: 2).
+  #order_lead_time: 5
+  # order_lead_time_range: [1, 3]      # uncomment for variable info delay
+
+  # ORDER lead time for the MANUFACTURER specifically (legacy default: 1).
+  #order_lead_time_mfr: 2
+  # order_lead_time_mfr_range: [1, 2]
+
+  # SHIPPING lead time, all echelons (legacy default: 2).
+  #ship_lead_time: 3
+  # ship_lead_time_range: [1, 3]       # variable transit / partial disruption
+
+  # PRODUCTION lead time at the manufacturer (legacy default: 2).
+  # production_lead_time: 2
+  #production_lead_time_range: [1, 4] # variable factory throughput
+
+  # LEGACY shim: the old boolean. If True AND no ship_lead_time* key is set, it
+  # reproduces the historical U(1,9) shipping jitter. Prefer ship_lead_time_range
+  # for new scenarios; keep this only for reproducing old jittery runs.
+  jittery_lead_time: False
+
+# ==============================================================================
+# EXAMPLE SCENARIOS  (copy a block up into `env:` to activate; these are
+# documentation, not active config)
+# ==============================================================================
+# --- "classic" (default, == original env) -----------------------------------
+#   (set nothing; the legacy defaults apply)
+#
+# --- "variable transit": stochastic shipping, everything else classic --------
+#   ship_lead_time_range: [1, 3]
+#   lookahead: 4                       # 4 >= 3, agent still sees full pipeline
+#
+# --- "supplier disruption": long, highly variable upstream shipping ----------
+#   ship_lead_time_range: [1, 8]
+#   lookahead: 8                       # raise so the agent isn't blind
+#
+# --- "slow factory": variable production bottleneck --------------------------
+#   production_lead_time_range: [2, 6]
+#   lookahead: 6
+#
+# --- "everything stochastic": full disruption stress test --------------------
+#   order_lead_time_range: [1, 3]
+#   ship_lead_time_range: [1, 4]
+#   production_lead_time_range: [1, 4]
+#   lookahead: 4
+#
+# NOTE on train/test hygiene: if you TRAIN with a lead-time range, keep at least
+# one DIFFERENT range (or fixed value) as a HELD-OUT TEST scenario, exactly as you
+# do for demand regimes — otherwise you are evaluating on your training support.
