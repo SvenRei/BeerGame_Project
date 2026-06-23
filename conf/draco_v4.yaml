@@ -14,7 +14,7 @@ use_context: true
 # ===================== actor head =====================
 # mlp = the head proven to learn for H1. switch to 'structured' once v4 is confirmed
 # learning, for the interpretable level-tracking experiments (H3/H4).
-actor_head: mlp
+actor_head: structured
 lead_init: 4.0
 demand_init: 8.0
 corr_scale: 6.0
@@ -24,7 +24,7 @@ s_bias_init: 40.0
 s_logstd_init: 0.7
 
 # ===================== communication (DIAL) =====================
-use_comm: true
+use_comm: false
 msg_dim: 4
 msg_penalty_coef: 0.0
 entropy_coef: 0.01

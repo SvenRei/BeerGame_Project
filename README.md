@@ -1,16 +1,20 @@
 # BeerGame
 
-This repository contains a research-grade framework evaluating cooperative Multi-Agent Reinforcement Learning (MARL) agents tasked with mitigating the bullwhip effect in a classic four-stage supply chain simulation (The Beer Game). The project introduces and benchmarks categorical communication protocols against traditional baseline MARL algorithms under Centralized Training, Decentralized Execution (CTDE) constraints.
+Paper: Regime-Adaptive Decentralized Ordering in Serial Supply Chains: What Communication Can and Cannot Buy, and an Interpretable Distillation
+
+This repository contains the official implementation of DRACO (Decentralized Regime-Adaptive Control). It provides a full reinforcement learning and evaluation framework for multi-agent serial supply chains facing regime uncertainty (non-stationary demand distributions).
 
 ## Core Methodology
 
-The environment models a classic decentralized supply chain consisting of four distinct stages: Retailer, Wholesaler, Distributor, and Manufacturer. Each stage operates under partial observability (Dec-POMDP), managing local inventory levels, incoming orders, backlogs, and shipment delays while minimizing cumulative holding and backlog costs.
+This project is built around two foundational theorems in Operations Research:
 
 The repository evaluates two core algorithmic families across communicating and non-communicating variants:
 
-    Value-Based Architectures (QMIX): Employs an explicit centralized mixing network to factor joint action-values (Qtot​) monotonically, enforcing structural stability under structural non-stationarity.
+    Clark & Scarf (1960): Echelon base-stock is optimal for serial systems with linear costs.
 
-    Policy-Based Architectures (MAPPO): Imploys a centralized critic sharing global environmental states to guide decentralized policy updates across cooperative actor networks.
+    Axsäter & Rosling (1993): Installation base-stock is equivalent to echelon base-stock in serial systems, meaning local information is sufficient for optimality.
+
+DRACO does not attempt to "beat" the Clark-Scarf optimum. Instead, it tackles the reality of deployment: classical base-stock policies must commit to a single inventory level across an unknown demand distribution, making them badly suboptimal under regime uncertainty. DRACO leverages context-based meta-RL (BAMDP) to infer the current demand regime and adapt its order-up-to levels dynamically, crushing the best regime-agnostic fixed base-stock policy while isolating the true marginal value of inter-agent communication.
 
 ## Communication Protocols
 
@@ -25,75 +29,52 @@ To address information asymmetry across independent supply chain entities, commu
 ```
 ├── agents/
 │   └── rl/
-│       ├── comm_utils.py          # Unified discrete vocabulary mapping definitions
-│       ├── mappo.py               # Actor-Critic network variants and MAPPOTrainer loops
-│       ├── qmix.py                # Value network definitions and centralized mixing modules
-│       ├── train_comm_qmix.py     # Training wrapper for communicating QMIX networks
-│       ├── train_ppo.py           # Unified training wrapper for MAPPO and IPPO variants
-│       └── train_qmix.py          # Training wrapper for baseline non-communicating QMIX
+│       └── comm_utils.py          # draco_v4.py
 ├── configs/                       # Hydra environment configuration mappings
 ├── envs/
 │   └── beer_game_env.py       # Custom PettingZoo/Gymnasium multi-agent Beer Game environment
-├── sweep_comm_mappo.yaml          # W&B Bayesian Sweep configuration for Comm-MAPPO
-├── sweep_comm_qmix.yaml           # W&B Bayesian Sweep configuration for Comm-QMIX
-├── sweep_mappo.yaml               # W&B Bayesian Sweep configuration for baseline MAPPO
-├── sweep_qmix.yaml                # W&B Bayesian Sweep configuration for baseline QMIX
+├── sweep_draco.yaml          # W&B Bayesian Sweep configuration for Comm-MAPPO
+├── sweep_comm.yaml           # W&B Bayesian Sweep configuration for Comm-QMIX
+├── README.md              # W&B Bayesian Sweep configuration for baseline QMIX
 └── requirements.txt               # Complete Python system and training dependencies
 ```
 
-## Dependencies & Environment Installation
+### Theoretical Backbone
 
-The codebase relies on PyTorch configured with CUDA 12.1 for tensor processing, alongside PettingZoo and Gymnasium for multi-agent environment compliance.
+| Result | Reference | Role in the Paper |
+| :--- | :--- | :--- |
+| **Echelon base-stock optimal, serial** | Clark & Scarf 1960 | The optimum / ceiling; why "beat base-stock" is impossible. |
+| **Installation = echelon (local sufficient)** | Axsäter & Rosling 1993 | Why comm is null at the optimum (H4); turns a null into a theorem. |
+| **Bullwhip from demand-signal-processing; value of info sharing** | Lee, Padmanabhan & Whang 1997 | The only mechanism for C2 > 0; predicts skip-level helps under non-stationarity. |
+| **Base-stock optimal under forecast evolution (MMFE)** | Heath & Jackson 1994 | Justifies belief → order-up-to-level under non-stationary demand. |
+| **Generalization of base-stock-regularized policies** | VC-theory, arXiv:2404.11509 | Why a structured/symbolic policy should extrapolate (H6). |
+| **BAMDP / context-based meta-RL** | VariBAD, PEARL | The formal frame for the belief encoder + regime inference (C1). |
+| **Symbolic policy distillation; distribution-shift caution** | SPID 2025; PySR (Cranmer 2023) | Method and honest fidelity reporting (C3). |
 
-An execution sandbox environment can be compiled directly via the following pipeline:
+## Planned study
 
-```
-# 1. Ensure system utilities are installed
-sudo apt update && sudo apt install -y git tmux python3-pip python3-venv
+# Study 1 — C1: regime inference (the spine)
 
-# 2. Set up an isolated Python Virtual Environment
-python3 -m venv venv
-source venv/bin/activate
+    Train: DRACO (no-comm) on the demand-randomization curriculum (λ ~ U[lo,hi] per episode + occasional within-episode shift).
+    Eval (the key table): a held-out set of stationary λ ∈ {6, 10, 14, 18, 22} (per-episode constant, unknown to the agent), scored against (a) best single fixed S, (b) per-λ oracle, (c) Sterman.
+    Primary metric: mean cost per regime; and the headline scalar fraction of the (fixed − oracle) gap recovered.
+    A lso: structure-recovery plot for H3 (learned S vs lead·d̂ + safety); in-support match for H1 (DRACO vs oracle on the training λ band).
+    Ablation (folds in point 1's comm-null): within Study 1, add neighbor-comm as one arm and show Δcost ≈ 0 vs no-comm (H4).
 
-# 3. Upgrade local installer and pull pinned dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-```
 
-## Automated Hyperparameter Optimization via W&B
+# Study 2 — C2: value-of-communication topology sweep
 
-Experiment telemetry and hyperparameter tracking are natively driven via Weights & Biases (W&B) Bayesian sweeps. The command configurations rely entirely on Hydra command-line overrides to dynamically mutate target configs without mutating on-disk script architecture.
-Launching a Master Sweep Controller
+    Manipulation: topology ∈ {no-comm, neighbor, skip-level, full} × demand stochasticity ∈ {stationary in-support, non-stationary (within-episode shifts), shock (black_swan/extreme_chaos)}.
+    Message: fixed content = sender's d̂ (Section 5).
+    Primary metric: paired Δcost vs no-comm (Wilcoxon over common seeds), per cell; reported as a topology × stochasticity surface.
+    Prediction: flat-≈0 under stationary (theorem); if anything is positive, it appears skip-level/full under non-stationarity (Lee et al.). Either outcome is the result — a flat surface is empirical confirmation of installation=echelon optimality in a learned setting, which is itself novel and citable.
+    Diagnostic (explains the sign): message-informativeness probe — does the shared d̂ reduce upstream forecast error vs forecasting from local orders? If comm helps, this must move; if it doesn't, that is the explanation for the null.
 
-To generate an active Sweep ID on the W&B master cluster, initialize the targeted configuration file from your deployment node:
 
-```
-# For communicating value-based sweeps
-wandb sweep sweep_comm_qmix.yaml
+# Study 3 — C3: symbolic distillation
 
-# For communicating policy-based sweeps
-wandb sweep sweep_comm_mappo.yaml
-```
+    Winner: the best Study-1 DRACO (the regime-adaptive policy).
+    Distill: PySR over (belief/observed features) → effective order-up-to level S, per stage. Expect to recover something close to lead·d̂ + safety with small corrections.
+    Test (H6): evaluate neural vs symbolic vs DAgger-refined symbolic on in-support and out-of-support regimes.
+    Report: OOD cost (does symbolic extrapolate ≥ neural?) and fidelity both on neural trajectories and under the symbolic policy's own rollouts (the gap quantifies distribution-shift inflation — the SPID caution).
 
-## Running Parallel Compute Workers
-
-To run multiple agents concurrently across your available CPU cores or distributed Spot instances without shell termination errors, wrap execution blocks within detached tmux sessions:
-
-```
-# 1. Create a persistent window manager session
-tmux new -s marl_sweeps
-
-# 2. Inside your tmux window, activate the virtual sandbox
-source venv/bin/activate
-
-# 3. Spin up an autonomous agent listener pointing to your W&B Sweep ID
-./venv/bin/python -m wandb agent <YOUR_ENTITY_OR_USERNAME>/BeerGame_Research/<SWEEP_ID>
-```
-
-To scale up processing throughput horizontally, open a new tmux window (Ctrl+B, then C) inside the session and repeat step 3 to attach up to 4 concurrent parallel execution agents within the same instance.
-
-To safely drop out of the terminal session while allowing background training sweeps to run continuously, detach the container using Ctrl+B, followed by D. To resume standard visual monitoring upon re-establishing a cloud connection, use:
-
-```
-tmux attach -t marl_sweeps
-```
