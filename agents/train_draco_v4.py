@@ -30,10 +30,11 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agents.rl.draco_v4 import (
+from agents.draco_v4 import (
     ADJ, DemandRandomizedBeerGame, make_encoder, make_actor,
     BaseStockActor, MessageHead, DistributionalCritic, DRACOTrainerV4, DRACORolloutBuffer,
 )
+from agents.heldout_eval import make_heldout_envs, run_heldout_eval   # held-out-lambda eval (C1 gate)
 from envs.beer_game_env import BeerGameParallelEnv
 
 
@@ -72,6 +73,16 @@ def main(cfg: DictConfig):
     eval_env_ood = BeerGameParallelEnv({**env_cfg, "demand_type": eval_ood_type})
     eval_every = cfg.agent.get("eval_every", 50)
     eval_episodes = cfg.agent.get("eval_episodes", 5)
+
+    # --- held-out-lambda eval (the C1 gate): score DRACO on stationary UNKNOWN poisson
+    #     regimes against the deployable fixed-policy BAR and the per-lambda CEILING from
+    #     `python baselines.py regime`. Watch Eval_lambda/Gap_Recovered: >=0 beats the bar
+    #     (C1 exists), 1.0 == oracle, <0 == no regime inference. Envs are built ONCE here. ---
+    heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg)
+    heldout_every  = cfg.agent.get("heldout_every", 200)
+    heldout_eps    = cfg.agent.get("heldout_episodes", 20)
+    heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4726.0)   # BAR     from `baselines.py regime`
+    heldout_oracle = cfg.agent.get("heldout_oracle_ref", 2202.0)  # CEILING from `baselines.py regime`
 
     run_dir = os.path.join(_ROOT, "weights_draco", f"run_dracov4_{run.id}")
     os.makedirs(run_dir, exist_ok=True)
@@ -275,6 +286,13 @@ def main(cfg: DictConfig):
             log[f"Eval/{eval_ood_type}_S_mean"] = sum(o_s_means) / eval_episodes
             log["Eval/Poisson_Order_mean"] = sum(p_ord_means) / eval_episodes
             log[f"Eval/{eval_ood_type}_Order_mean"] = sum(o_ord_means) / eval_episodes
+
+        # held-out-lambda eval (C1 gate): reuses run_episode (deterministic) on the
+        # stationary unknown-regime envs; adds Eval_lambda/* incl. Gap_Recovered to `log`.
+        if ep > warm_up and ep % heldout_every == 0:
+            log.update(run_heldout_eval(
+                run_episode, heldout_envs, base_seed, heldout_eps,
+                fixed_ref=heldout_fixed, oracle_ref=heldout_oracle))
 
         wandb.log(log)
 

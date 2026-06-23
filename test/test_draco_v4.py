@@ -24,7 +24,7 @@ from torch.distributions import Normal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # repo root on path
 
-from agents.rl.draco_v4 import (
+from agents.draco_v4 import (
     ADJ, DemandRandomizedBeerGame, make_encoder, make_actor,
     BaseStockActor, BaseStockActorStructured, MessageHead,
     DistributionalCritic, ValueCritic, RunningNorm,

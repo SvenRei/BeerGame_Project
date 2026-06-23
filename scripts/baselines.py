@@ -47,6 +47,13 @@ AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 ENV_BASE = {"horizon": 50, "max_order": 100, "holding_cost": 0.5, "backorder_cost": 1.0}
 SEED_BASE = 100000          # held-out eval seed space (disjoint from training seeds)
 
+# The held-out demand regimes for the REGIME-UNCERTAINTY study (C1). Each lambda is a
+# STATIONARY poisson rate the policy does not know in advance. The two reference numbers
+# the DRACO held-out-lambda eval is scored against (best single fixed S = the deployable
+# BAR; per-lambda oracle = the privileged CEILING) are produced by `regime_benchmark`.
+# Keep this list in sync with HELDOUT_LAMBDAS in the trainer's held-out eval.
+HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
+
 
 # ==============================================================================
 # Env access + rollout harness (the ONE place policies meet the environment)
@@ -365,6 +372,134 @@ def selftest():
 
 
 # ==============================================================================
+# REGIME-UNCERTAINTY baselines (C1): the BAR (best single fixed base-stock with no
+# regime knowledge) vs the CEILING (per-lambda oracle). The headroom between them is
+# what an adaptive, regime-inferring policy (DRACO) can capture. These run on a
+# poisson env whose rate is varied per regime via a thin subclass -- equivalent to the
+# agent's DemandRandomizedBeerGame(lo=hi=lam, p_shift=0): both draw np_random.poisson(lam)
+# off an env RNG seeded by `seed`, so these numbers are CRN-comparable to the DRACO
+# held-out-lambda eval at the SAME seeds (SEED_BASE + e).
+# ==============================================================================
+def _make_lambda_env_class(base_cls):
+    """Subclass `base_cls` (the project env) so the poisson rate is read from config
+    key 'poisson_lam' (default 8). Only demand_type 'poisson' is affected; the env
+    file is untouched and every other regime passes straight through."""
+    class _PoissonLambdaEnv(base_cls):
+        def _roll_stochastic_demand(self, step):
+            if self._config.get("demand_type") == "poisson":
+                return self.np_random.poisson(float(self._config.get("poisson_lam", 8.0)))
+            return super()._roll_stochastic_demand(step)
+    return _PoissonLambdaEnv
+
+
+def _mean_cost_at_lambda(policy, lam, episodes, LamEnv, env_cfg, seed_base):
+    tot = 0.0
+    for e in range(episodes):
+        env = LamEnv({**env_cfg, "demand_type": "poisson", "poisson_lam": float(lam)})
+        c, _ = rollout(env, policy, seed_base + e)
+        tot += c
+    return tot / episodes
+
+
+def cost_across_lambdas(policy, lambdas, episodes=15, env_cfg=None, env_class=None,
+                        seed_base=SEED_BASE):
+    """Mean cost of a FIXED policy at each lambda. Returns {lam: mean_cost}."""
+    env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
+    LamEnv = _make_lambda_env_class(env_class or get_env_class())
+    return {lam: _mean_cost_at_lambda(policy, lam, episodes, LamEnv, env_cfg, seed_base)
+            for lam in lambdas}
+
+
+def best_single_fixed_S(lambdas, episodes=15, env_cfg=None, env_class=None,
+                        seed_base=SEED_BASE, lo=20, hi=160, step=4,
+                        per_echelon=False, rounds=3, verbose=True):
+    """The DEPLOYABLE BAR: ONE base-stock committed across the whole lambda set, chosen
+    with NO regime knowledge (minimizes mean cost across lambdas). Uniform by default;
+    per_echelon=True coordinate-descends a 4-vector for a tighter bar.
+    Returns (S_vec, {lam: cost_at_that_lam_for_the_chosen_S}, mean_cost)."""
+    env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
+    LamEnv = _make_lambda_env_class(env_class or get_env_class())
+
+    def mean_cost_of(S_vec):
+        per = {lam: _mean_cost_at_lambda(BaseStockPolicy(S_vec), lam, episodes, LamEnv, env_cfg, seed_base)
+               for lam in lambdas}
+        return float(np.mean(list(per.values()))), per
+
+    best_S, best_mean, best_per = None, np.inf, None
+    for s in range(lo, hi + 1, step):                       # uniform grid for the shared level
+        m, per = mean_cost_of([float(s)] * 4)
+        if m < best_mean:
+            best_S, best_mean, best_per = [float(s)] * 4, m, per
+    if per_echelon:                                          # optional per-echelon refinement
+        S = list(best_S)
+        for _ in range(rounds):
+            improved = False
+            for i in range(4):
+                for s in range(lo, hi + 1, step):
+                    cand = list(S); cand[i] = float(s)
+                    m, per = mean_cost_of(cand)
+                    if m < best_mean - 1e-6:
+                        S, best_S, best_mean, best_per, improved = cand, cand, m, per, True
+            if not improved:
+                break
+    if verbose:
+        kind = "per-echelon" if per_echelon else "uniform"
+        print(f"  best single fixed S ({kind}): [{','.join(f'{x:.0f}' for x in best_S)}]  "
+              f"mean_cost={best_mean:.1f}")
+    return best_S, best_per, best_mean
+
+
+def per_lambda_oracle(lambdas, episodes=15, env_cfg=None, env_class=None,
+                      seed_base=SEED_BASE, lo=20, hi=160, step=4, verbose=True):
+    """The privileged CEILING: best uniform S chosen SEPARATELY for each lambda (the
+    policy is allowed to know the regime). Returns ({lam: (S, cost)}, mean_cost)."""
+    env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
+    LamEnv = _make_lambda_env_class(env_class or get_env_class())
+    out = {}
+    for lam in lambdas:
+        best_s, best_c = None, np.inf
+        for s in range(lo, hi + 1, step):
+            mc = _mean_cost_at_lambda(BaseStockPolicy([float(s)] * 4), lam, episodes, LamEnv, env_cfg, seed_base)
+            if mc < best_c:
+                best_s, best_c = float(s), mc
+        out[lam] = (best_s, best_c)
+        if verbose:
+            print(f"    lam={lam:>4g}: S~{best_s:>3.0f}  cost={best_c:8.1f}")
+    return out, float(np.mean([c for _, c in out.values()]))
+
+
+def regime_benchmark(lambdas=None, episodes=15, env_cfg=None, env_class=None,
+                     seed_base=SEED_BASE, per_echelon=False, sterman=None):
+    """Print the regime-uncertainty ladder and the C1 reference numbers:
+        per-lambda ORACLE  (CEILING)  -- DRACO approaches but cannot beat (privileged),
+        best single fixed  (the BAR)  -- the deployable policy DRACO must beat,
+        headroom = BAR - CEILING       -- what regime inference can capture.
+    Feed the two numbers into the trainer's held-out eval (heldout_fixed_ref / _oracle_ref)."""
+    lambdas = list(HELDOUT_LAMBDAS if lambdas is None else lambdas)
+    print("=" * 72)
+    print(f"REGIME-UNCERTAINTY BENCHMARK  |  lambda in {[f'{l:g}' for l in lambdas]}  "
+          f"|  {episodes} eps/lambda  |  seed_base={seed_base}")
+    print("=" * 72)
+    print("per-lambda ORACLE (privileged: knows the regime):")
+    oracle, oracle_mean = per_lambda_oracle(lambdas, episodes, env_cfg, env_class, seed_base)
+    print(f"  -> oracle mean cost (CEILING, unattainable) = {oracle_mean:.1f}\n")
+    bestS, _, fixed_mean = best_single_fixed_S(
+        lambdas, episodes, env_cfg, env_class, seed_base, per_echelon=per_echelon)
+    print(f"  -> best single fixed cost (DEPLOYABLE BAR)  = {fixed_mean:.1f}\n")
+    head = fixed_mean - oracle_mean
+    print(f"HEADROOM (BAR - CEILING) = {head:.1f}  "
+          f"({100 * head / max(1e-6, fixed_mean):.0f}% of the fixed-policy cost)")
+    print(f"  DRACO target: beat {fixed_mean:.0f}, approach {oracle_mean:.0f}.")
+    print(f"  -> set in the trainer:  heldout_fixed_ref={fixed_mean:.0f}  "
+          f"heldout_oracle_ref={oracle_mean:.0f}")
+    if sterman is not None:
+        per = cost_across_lambdas(sterman, lambdas, episodes, env_cfg, env_class, seed_base)
+        print(f"  Sterman behavioral floor (mean across lambda) = {np.mean(list(per.values())):.1f}")
+    return dict(oracle=oracle, oracle_mean=oracle_mean, fixed_S=bestS,
+                fixed_mean=fixed_mean, headroom=head)
+
+
+# ==============================================================================
 # CLI
 # ==============================================================================
 def main():
@@ -395,10 +530,24 @@ def main():
                     metavar=("THETA", "ALPHA_S", "BETA", "S_PRIME"),
                     help="Sterman params (shared across echelons)")
 
+    pr = sub.add_parser("regime", help="regime-uncertainty ladder: fixed-policy BAR vs per-lambda CEILING (C1 reference)")
+    pr.add_argument("--lambdas", nargs="+", type=float, default=HELDOUT_LAMBDAS,
+                    help="stationary poisson rates forming the unknown-regime test set")
+    pr.add_argument("--episodes", type=int, default=15, help="episodes per lambda")
+    pr.add_argument("--per-echelon", action="store_true",
+                    help="coordinate-descend the single fixed S per-echelon (slower, tighter bar)")
+    pr.add_argument("--sterman", nargs=4, type=float, default=None,
+                    metavar=("THETA", "ALPHA_S", "BETA", "S_PRIME"),
+                    help="also report the Sterman behavioral floor across the lambdas")
+
     args = ap.parse_args()
 
     if args.cmd == "selftest":
         selftest()
+
+    elif args.cmd == "regime":
+        sterman = StermanPolicy(*args.sterman) if args.sterman else None
+        regime_benchmark(args.lambdas, args.episodes, per_echelon=args.per_echelon, sterman=sterman)
 
     elif args.cmd == "serial":
         S, c = coord_descent_serial(args.lam, args.L, args.h, args.b)

@@ -17,6 +17,7 @@ weights_comm_mappo/
 weights_qmix/
 weights_comm_qmix/
 weights_ippo/
+weights_draco/
 *.pth
 *.log
 *.png
