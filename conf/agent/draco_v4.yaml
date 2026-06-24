@@ -30,9 +30,10 @@ s_logstd_init: 0.7
 use_comm: false
 comm_topology: neighbor   # NEW (Study 2): neighbor | skip | full  (see agents/topologies.py).
                           # Only used when use_comm=true. neighbor == the original chain ADJ.
-msg_dim: 4
+msg_dim: 1
 msg_penalty_coef: 0.0
 entropy_coef: 0.01
+msg_mode: dhat
 
 # ===================== critic =====================
 critic_uses_belief: true
