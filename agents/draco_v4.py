@@ -455,6 +455,7 @@ class DRACOTrainerV4:
         self.device = device
         self.N = n_agents
         self.adj = adj.to(device)
+        self.msg_mode = cfg.get("msg_mode", "learned")   # "learned" DIAL | "dhat" broadcast (Phase 3)
 
         self.gamma = float(cfg.get("gamma", 0.99))
         self.gae_lambda = float(cfg.get("gae_lambda", 0.95))
@@ -605,7 +606,10 @@ class DRACOTrainerV4:
                 T = d["obs"].size(0)
                 z = d["z"]; z_act = z if self.use_context else torch.zeros_like(z)
                 if self.use_comm:
-                    m = torch.stack([self.msg_heads[i](d["obs"][:, i], z[:, i]) for i in range(N)], dim=1)
+                    if self.msg_mode == "dhat":     # broadcast detached d_hat: message is a readout, no DIAL gradient
+                        m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() for i in range(N)], dim=1)
+                    else:
+                        m = torch.stack([self.msg_heads[i](d["obs"][:, i], z[:, i]) for i in range(N)], dim=1)
                     routed = torch.einsum("ij,tjm->tim", self.adj, m)
                     incoming = torch.cat([torch.zeros(1, N, m.size(-1), device=dev), routed[:-1]], dim=0)
                 else:

@@ -1,6 +1,7 @@
 # conf/agent/draco_v4.yaml
 # DRACO v4 -- single self-contained agent. Select with `defaults: - agent: draco_v4`.
-# All three debugged fixes are baked into the defaults below.
+# Defaults below reproduce the validated C1 run (Gap_Recovered crossed 0): structured
+# head, no comm, stationary DR curriculum covering the held-out lambdas, grounded d_hat.
 algorithm: draco_v4
 
 # ===================== BAMDP belief (recurrent) =====================
@@ -12,31 +13,36 @@ belief_sample: false
 use_context: true
 
 # ===================== actor head =====================
-# mlp = the head proven to learn for H1. switch to 'structured' once v4 is confirmed
-# learning, for the interpretable level-tracking experiments (H3/H4).
+# structured = interpretable base-stock head S = softplus(lead*d_hat + safety + corr).
+# mlp = free-S negative control (Study-4 / H3). Live selector is `actor_head`.
 actor_head: structured
 lead_init: 4.0
 demand_init: 8.0
 corr_scale: 6.0
-demand_aux_coef: 0.05
+demand_aux_coef: 0.3      # raised from 0.05: at 0.05 the d_hat range compressed and S
+                          # would not fan across lambda; 0.3 grounds the demand readout
+                          # enough for the head to track the regime (the C1 fix).
 s_smooth_coef: 0.0
 s_bias_init: 40.0
 s_logstd_init: 0.7
 
 # ===================== communication (DIAL) =====================
 use_comm: false
+comm_topology: neighbor   # NEW (Study 2): neighbor | skip | full  (see agents/topologies.py).
+                          # Only used when use_comm=true. neighbor == the original chain ADJ.
 msg_dim: 4
 msg_penalty_coef: 0.0
 entropy_coef: 0.01
 
-# ===================== belief-conditioned distributional critic =====================
+# ===================== critic =====================
 critic_uses_belief: true
-n_quantiles: 32
+n_quantiles: 32           # [v4-INERT] critic is scalar in v4 (value-normalized); kept for
+                          # checkpoint/back-compat only -- not read by the live trainer.
 
-# --- NEW: Explicitly declare the v4 architecture flags ---
-structured_head: true   # default to the structured head
-order_cap_coef: 0.0     # default safety valve off
-corr_l2_coef: 0.0       # default safety valve off
+# --- v4 architecture flags ---
+structured_head: true     # [v4-INERT/legacy] the LIVE head selector is `actor_head` above.
+order_cap_coef: 0.0       # safety valve off
+corr_l2_coef: 0.0         # safety valve off (raise to ~1e-3 if S won't come DOWN at low lambda)
 
 # ===================== risk OFF by default =====================
 risk_eta: 0.0
@@ -44,26 +50,21 @@ cvar_alpha: 0.2
 
 # ===================== SRDQN per-agent shaping =====================
 srdqn_beta: 0.5
-# [FIX 1] reward_scale keeps the value target in the critic's reachable range.
-# With raw cost ~9/step over a 50-step horizon, scale 50 -> lambda-return ~ -35,
-# the range at which the critic was observed to TRACK in probes. Do NOT set this to 1
-# (target ~ -1800, the critic never reaches it -> uniformly negative advantages ->
-# frozen actor) and do NOT leave it at 100 (target too small, weak gradient).
-reward_scale: 50.0
+reward_scale: 50.0        # [v4-INERT] v4 uses running value-normalization instead of a fixed
+                          # reward_scale; kept for back-compat only -- not read by the trainer.
 
 # ===================== PPO / optimisation =====================
 gamma: 0.99
 gae_lambda: 0.95
 k_epochs: 4
-critic_epochs: 8          # [FIX 2 support] train the critic harder so V tracks the
-                          # lambda-return target quickly (= more critic steps/update)
+critic_epochs: 8
 eps_clip: 0.2
 max_grad_norm: 0.5
 lr_actor: 3.0e-4
 lr_msg: 3.0e-4
 lr_critic: 1.0e-3
 lr_encoder: 1.0e-3        # raised so the belief encodes demand fast (supports [FIX 3])
-polyak_tau: 0.005
+polyak_tau: 0.005         # [v4-INERT] no Polyak target net in v4; kept for back-compat only.
 hidden_dim: 128
 
 # ===================== training schedule =====================
@@ -75,12 +76,24 @@ lr_scheduler_gamma: 0.5
 trace_every: 0
 
 # ===================== demand-randomisation curriculum = p(T) =====================
-dr_lambda_lo: 6.0
-dr_lambda_hi: 20.0
-dr_p_shift: 0.4
+# C1-validated: covers the held-out lambdas {6,10,14,18,22} so the held-out eval tests
+# regime INFERENCE, not extrapolation. dr_p_shift=0 = stationary (matches the stationary
+# held-out test). For a robustness/non-stationary variant (Study 2 secondary), set
+# dr_p_shift=0.4 on the CLI.
+dr_lambda_lo: 4.0
+dr_lambda_hi: 24.0
+dr_p_shift: 0.0
 dr_shift_scale: 2.5
 
 # ===================== in-training evaluation =====================
 eval_every: 50
 eval_episodes: 5
 ood_eval_type: black_swan
+
+# ===================== held-out-lambda eval (C1 gate) =====================
+# Scores DRACO on stationary unknown regimes vs the fixed-policy BAR / per-lambda CEILING
+# from `python scripts/baselines.py regime`. Watch Eval_lambda/Gap_Recovered.
+heldout_every: 200        # eval cadence (episodes). 100 for denser pilots, 400 for the sweep.
+heldout_episodes: 8       # episodes per lambda. 8 = fast/readable pilot; 20 = clean sweep number.
+heldout_fixed_ref: 4726.0 # BAR     (best single fixed base-stock) -- regenerate via baselines.py
+heldout_oracle_ref: 2202.0 # CEILING (per-lambda oracle)           -- regenerate via baselines.py

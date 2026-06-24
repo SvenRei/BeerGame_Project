@@ -12,7 +12,7 @@ The repository evaluates two core algorithmic families across communicating and 
 
     Clark & Scarf (1960): Echelon base-stock is optimal for serial systems with linear costs.
 
-    Axsäter & Rosling (1993): Installation base-stock is equivalent to echelon base-stock in serial systems, meaning local information is sufficient for optimality.
+        
 
 DRACO does not attempt to "beat" the Clark-Scarf optimum. Instead, it tackles the reality of deployment: classical base-stock policies must commit to a single inventory level across an unknown demand distribution, making them badly suboptimal under regime uncertainty. DRACO leverages context-based meta-RL (BAMDP) to infer the current demand regime and adapt its order-up-to levels dynamically, crushing the best regime-agnostic fixed base-stock policy while isolating the true marginal value of inter-agent communication.
 

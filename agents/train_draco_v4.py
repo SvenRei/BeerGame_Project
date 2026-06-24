@@ -34,7 +34,8 @@ from agents.draco_v4 import (
     ADJ, DemandRandomizedBeerGame, make_encoder, make_actor,
     BaseStockActor, MessageHead, DistributionalCritic, DRACOTrainerV4, DRACORolloutBuffer,
 )
-from agents.heldout_eval import make_heldout_envs, run_heldout_eval   # held-out-lambda eval (C1 gate)
+from agents.heldout_eval import make_heldout_envs, run_heldout_eval, HELDOUT_LAMBDAS  # held-out-lambda eval (C1 gate)
+from agents.topologies import get_adj                                 # Study-2 comm topology selector
 from envs.beer_game_env import BeerGameParallelEnv
 
 
@@ -78,7 +79,8 @@ def main(cfg: DictConfig):
     #     regimes against the deployable fixed-policy BAR and the per-lambda CEILING from
     #     `python baselines.py regime`. Watch Eval_lambda/Gap_Recovered: >=0 beats the bar
     #     (C1 exists), 1.0 == oracle, <0 == no regime inference. Envs are built ONCE here. ---
-    heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg)
+    heldout_lams   = list(cfg.agent.get("heldout_lambdas", HELDOUT_LAMBDAS))  # val split (Phase1) vs test split (Phase2)
+    heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg, heldout_lams)
     heldout_every  = cfg.agent.get("heldout_every", 200)
     heldout_eps    = cfg.agent.get("heldout_episodes", 20)
     heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4726.0)   # BAR     from `baselines.py regime`
@@ -100,7 +102,7 @@ def main(cfg: DictConfig):
     n_quant = cfg.agent.get("n_quantiles", 32)
     encoder_type = cfg.agent.get("encoder_type", "gru")       # recurrent belief by default
     belief_sample = bool(cfg.agent.get("belief_sample", False))
-    adj = ADJ.to(device)
+    adj = get_adj(cfg.agent.get("comm_topology", "neighbor")).to(device)   # Study-2 topology selector
 
     # --- guard: the CRAFT positional-encoding window must cover the whole episode
     #     (the update encodes the full T=horizon sequence at once). ---
@@ -112,6 +114,7 @@ def main(cfg: DictConfig):
     s_bias_init = cfg.agent.get("s_bias_init", 40.0)
     s_logstd_init = cfg.agent.get("s_logstd_init", 0.7)
     use_comm = cfg.agent.get("use_comm", True)
+    msg_mode = cfg.agent.get("msg_mode", "learned")   # "learned" DIAL vector | "dhat" broadcast (Phase 3)
     use_context = cfg.agent.get("use_context", True)
 
     # --- modules (B encoder | A actors | C msg heads | D belief-conditioned critic) ---
@@ -191,11 +194,15 @@ def main(cfg: DictConfig):
             #    for i, name in enumerate(_names):
             #        print(f"  {name:12s} S={S[i, 0].item():7.2f}  z_mean={z_act[i].mean().item():+.3f}", flush=True)
 
-            # DIAL messages: deterministic, continuous, from DETACHED belief + obs
+            # messages: learned DIAL vector, OR (Phase 3) broadcast the detached demand belief d_hat
             m_out = torch.zeros(N, msg_dim, device=device)
             if use_comm:
-                for i in range(N):
-                    m_out[i] = msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)
+                if msg_mode == "dhat":                                            # d_hat broadcast -> interpretable, msg_dim must be 1
+                    for i in range(N):
+                        m_out[i] = actors[i].demand_estimate(z_t[i:i + 1]).reshape(-1)
+                else:
+                    for i in range(N):
+                        m_out[i] = msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)
 
             order, IP = BaseStockActor.order_from_S(S, o_t, max_order)            # [N,1]
             frac = (order / max_order).clamp(0.0, 1.0)
