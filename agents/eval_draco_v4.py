@@ -140,7 +140,7 @@ class DracoV4Policy:
         if self.use_comm and not self.ablate and (self.msg_mode == "dhat" or self.msg_heads is not None):
             if self.msg_mode == "dhat" and self.has_dhat:
                 for i in range(self.N):
-                    m_out[i] = self.actors[i].demand_estimate(z_act[i:i + 1]).reshape(-1)
+                    m_out[i] = self.actors[i].demand_estimate(z_act[i:i + 1]).reshape(-1) / 100.0
             else:
                 for i in range(self.N):
                     m_out[i] = self.msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)

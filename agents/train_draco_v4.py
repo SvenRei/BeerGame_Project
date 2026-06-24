@@ -199,7 +199,7 @@ def main(cfg: DictConfig):
             if use_comm:
                 if msg_mode == "dhat":                                            # d_hat broadcast -> interpretable, msg_dim must be 1
                     for i in range(N):
-                        m_out[i] = actors[i].demand_estimate(z_t[i:i + 1]).reshape(-1)
+                        m_out[i] = actors[i].demand_estimate(z_t[i:i + 1]).reshape(-1) / 100.0
                 else:
                     for i in range(N):
                         m_out[i] = msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)
