@@ -607,7 +607,7 @@ class DRACOTrainerV4:
                 z = d["z"]; z_act = z if self.use_context else torch.zeros_like(z)
                 if self.use_comm:
                     if self.msg_mode == "dhat":     # broadcast detached d_hat: message is a readout, no DIAL gradient
-                        m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() for i in range(N)], dim=1)
+                        m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() / 100.0 for i in range(N)], dim=1)
                     else:
                         m = torch.stack([self.msg_heads[i](d["obs"][:, i], z[:, i]) for i in range(N)], dim=1)
                     routed = torch.einsum("ij,tjm->tim", self.adj, m)
