@@ -294,31 +294,36 @@ def main(cfg: DictConfig):
             log["Eval/Poisson_Order_mean"] = sum(p_ord_means) / eval_episodes
             log[f"Eval/{eval_ood_type}_Order_mean"] = sum(o_ord_means) / eval_episodes
 
-        # held-out-lambda eval (C1 gate): reuses run_episode (deterministic) on the
-        # stationary unknown-regime envs; adds Eval_lambda/* incl. Gap_Recovered to `log`.
+        # held-out-lambda eval (C1 gate) + checkpoint/early-stop ON THE HELD-OUT METRIC.
+        # The 50-ep training cost is the WRONG selection signal under the DR curriculum: a
+        # lucky window of low-lambda episodes makes it dip, checkpointing a policy that isn't
+        # actually best on the held-out regimes. We select on Eval_lambda/Mean_Cost instead.
         if ep > warm_up and ep % heldout_every == 0:
-            log.update(run_heldout_eval(
-                run_episode, heldout_envs, base_seed, heldout_eps,
-                fixed_ref=heldout_fixed, oracle_ref=heldout_oracle))
-
-        wandb.log(log)
-
-        # checkpoint on improvement (every episode)
-        if ep == warm_up:
-            best, since_imp = float("inf"), 0
-        if avg < best and len(cost_hist) == 50:
-            best, since_imp = avg, 0
-            if ep >= warm_up:
+            hl = run_heldout_eval(run_episode, heldout_envs, base_seed, heldout_eps,
+                                  fixed_ref=heldout_fixed, oracle_ref=heldout_oracle)
+            log.update(hl)
+            hcost = hl["Eval_lambda/Mean_Cost"]
+            if hcost < best:
+                best, since_imp = hcost, 0
                 _torch_save({"encoder": encoder.state_dict(),
                              "actors": [a.state_dict() for a in actors],
                              "msg_heads": [m.state_dict() for m in msg_heads],
                              "critic": critic.state_dict(),
                              "config": OmegaConf.to_container(cfg, resolve=True),
-                             "episode": ep, "best_avg_cost": best},
+                             "episode": ep, "best_heldout_cost": best},
                             os.path.join(run_dir, "draco_checkpoint_best.pt"))
-        else:
-            if ep >= warm_up:
+            else:
                 since_imp += 1
+            # early stop on HELD-OUT plateau (patience is in EPISODES -> convert to eval rounds)
+            if since_imp >= max(1, patience // max(1, heldout_every)):
+                wandb.log(log)
+                print(f"[draco-v4] early stop at ep {ep} (held-out plateau; best Mean_Cost={best:.1f}).", flush=True)
+                break
+
+        wandb.log(log)
+
+        # checkpoint + early-stop now happen in the held-out eval block above (on Mean_Cost).
+
 
         if trace_every and ep > warm_up and ep % trace_every == 0:
             rows = []
@@ -328,9 +333,6 @@ def main(cfg: DictConfig):
                 with open(path, "w", newline="") as f:
                     w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
 
-        if ep > warm_up and since_imp >= patience:
-            print(f"[draco-v4] early stop at ep {ep}.", flush=True)
-            break
         if ep % 10 == 0 or ep < 3:
             print(f"Ep {ep} | Cost {ep_cost:.1f} | 50-avg {avg:.1f} | "
                   f"best {best if best != float('inf') else 0:.1f}", flush=True)

@@ -18,15 +18,18 @@
 # Usage (SAME seeds as Phase 2 so comm is CRN-paired against the nocomm refs):
 #   ./run_phase3_c2.sh 10 11 12 13 14
 set -euo pipefail
-cd /workspace/BeerGame
-export WANDB_API_KEY=...
+set -f   # disable globbing so Hydra list overrides like [8,12,16,20] aren't mangled by bash
+cd /workspace/BeerGame_Project  
+
 
 LOCKED="agent.demand_aux_coef=0.3 agent.z_dim=8 agent.encoder_type=gru"   # from Phase 1
-TEST="agent.heldout_lambdas=[6,10,14,18,22] agent.heldout_fixed_ref=4726 agent.heldout_oracle_ref=2202"
+# SELECTION on VALIDATION lambdas (checkpoint/early-stop key off held-out Mean_Cost -> don't
+# train on test). Comm value is measured POST-HOC on the test set (see bottom).
+VAL="agent.heldout_lambdas=[8,12,16,20]"
 BASE="agent=draco_v4 agent.actor_head=structured agent.use_context=true \
       agent.dr_lambda_lo=4 agent.dr_lambda_hi=24 \
       agent.heldout_every=400 agent.heldout_episodes=20 \
-      total_episodes=10000 agent.batch_episodes=16 agent.patience=3000 $LOCKED $TEST"
+      total_episodes=15000 agent.batch_episodes=16 agent.patience=3000 $LOCKED $VAL"
 DHAT="agent.msg_mode=dhat agent.msg_dim=1"
 
 for SEED in "$@"; do
@@ -38,7 +41,7 @@ for SEED in "$@"; do
       agent.use_comm=false seed=$SEED agent.algorithm=c2_${TAG}_nocomm_s${SEED}
 
     # d_hat broadcast over widening topologies
-    for TOP in neighbor skip full retailer_broadcast; do
+    for TOP in neighbor no_neighbor skip full retailer_broadcast; do
       python agents/train_draco_v4.py $BASE agent.dr_p_shift=$PS $DHAT \
         agent.use_comm=true agent.comm_topology=$TOP \
         seed=$SEED agent.algorithm=c2_${TAG}_${TOP}_s${SEED}

@@ -6,6 +6,8 @@ set -euo pipefail
 echo ">>> 1. Updating system packages..."
 apt-get update -y
 apt-get install -y git curl wget build-essential python3-venv
+apt-get install -y git curl wget build-essential python3-venv zip unzip
+
 
 echo ">>> 2. Installing Julia (Required for PySR symbolic distillation)..."
 # PySR requires a local Julia installation to perform the symbolic regression search

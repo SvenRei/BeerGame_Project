@@ -246,6 +246,10 @@ def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS):
 def message_analysis(ckpt, episodes=40, scenario="poisson"):
     env = BeerGameParallelEnv({**ENV_BASE, "demand_type": scenario})
     pol_on = DracoV4Policy(ckpt, env, ablate=False)
+    if not pol_on.use_comm:
+        print("\n  message analysis: checkpoint has use_comm=false. Skipped.")
+        return None
+        
     if pol_on.msg_heads is None:
         print("\n  message analysis: checkpoint has no comm channel (use_comm was false). skipped.")
         return None
@@ -270,7 +274,7 @@ def message_analysis(ckpt, episodes=40, scenario="poisson"):
     print(f"    {'sender':<13}{'|msg| mean':>11}{'sat>0.9':>9}{'corr(ch0,demand)':>18}")
     for i, a in enumerate(AGENTS):
         ch = msg[:, i, :]
-        sat = float(np.mean(np.abs(np.tanh(ch)) > 0.9))
+        sat = float(np.mean(np.abs(ch) > 0.9))
         absm = float(np.mean(np.abs(ch)))
         c0 = ch[:, 0]
         corr = float(np.corrcoef(c0, cust)[0, 1]) if np.std(c0) > 1e-8 else float("nan")

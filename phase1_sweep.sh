@@ -13,15 +13,16 @@
 # 18 configs x the seeds you pass. Parallelize BY SEED across pods:
 #   pod A: ./run_phase1_hpsweep.sh 0     pod B: ... 1     pod C: ... 2
 set -euo pipefail
-cd /workspace/BeerGame                         # <-- make this consistent across ALL your scripts
-export WANDB_API_KEY=...
+set -f   # disable globbing so Hydra list overrides like [8,12,16,20] aren't mangled by bash
+cd /workspace/BeerGame_Project                      # <-- make this consistent across ALL your scripts
+
 
 VAL="agent.heldout_lambdas=[8,12,16,20]"       # validation split (NOT the C1 test lambdas)
 BASE="agent=draco_v4 agent.use_comm=false \
       agent.actor_head=structured agent.use_context=true \
       agent.dr_lambda_lo=4 agent.dr_lambda_hi=24 agent.dr_p_shift=0.0 \
       agent.heldout_every=400 agent.heldout_episodes=20 \
-      total_episodes=8000 agent.batch_episodes=16 agent.patience=3000 $VAL"
+      total_episodes=15000 agent.batch_episodes=16 agent.patience=3000 $VAL"
 
 for SEED in "$@"; do
   for AUX in 0.1 0.3 0.5; do                   # grounding strength (0.3 validated; brackets it)
