@@ -31,7 +31,7 @@ VAL="agent.heldout_lambdas=[8,12,16,20]"
 BASE="agent=draco_v4 agent.actor_head=structured agent.use_context=true \
       agent.dr_lambda_lo=4 agent.dr_lambda_hi=24 \
       agent.heldout_every=400 agent.heldout_episodes=20 \
-      total_episodes=15000 agent.batch_episodes=16 agent.patience=3000 $LOCKED $VAL"
+      total_episodes=15000 agent.batch_episodes=8 agent.patience=3000 $LOCKED $VAL"
 DHAT="agent.msg_mode=dhat agent.msg_dim=1"
 
 for SEED in "$@"; do

@@ -24,7 +24,7 @@ BASE="agent=draco_v4 agent.use_comm=false \
       agent.actor_head=structured agent.use_context=true \
       agent.dr_lambda_lo=4 agent.dr_lambda_hi=24 agent.dr_p_shift=0.0 \
       agent.heldout_every=400 agent.heldout_episodes=20 \
-      total_episodes=15000 agent.batch_episodes=16 agent.patience=3000 $VAL"
+      total_episodes=15000 agent.batch_episodes=8 agent.patience=3000 $VAL"
 
 for SEED in "$@"; do
   for AUX in 0.1 0.3 0.5; do                   # grounding strength (0.3 validated; brackets it)
