@@ -83,8 +83,8 @@ def main(cfg: DictConfig):
     heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg, heldout_lams)
     heldout_every  = cfg.agent.get("heldout_every", 200)
     heldout_eps    = cfg.agent.get("heldout_episodes", 20)
-    heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4726.0)   # BAR     from `baselines.py regime`
-    heldout_oracle = cfg.agent.get("heldout_oracle_ref", 2202.0)  # CEILING from `baselines.py regime`
+    heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4268.0)   # BAR     from `baselines.py regime`
+    heldout_oracle = cfg.agent.get("heldout_oracle_ref", 1987.0)  # CEILING from `baselines.py regime`
 
     run_dir = os.path.join(_ROOT, "weights_draco", f"run_dracov4_{run.id}")
     os.makedirs(run_dir, exist_ok=True)

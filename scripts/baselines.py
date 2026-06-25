@@ -38,6 +38,7 @@ Run:
 import argparse
 import os
 import sys
+import json
 import numpy as np
 from collections import deque
 
@@ -450,21 +451,24 @@ def best_single_fixed_S(lambdas, episodes=15, env_cfg=None, env_class=None,
 
 
 def per_lambda_oracle(lambdas, episodes=15, env_cfg=None, env_class=None,
-                      seed_base=SEED_BASE, lo=20, hi=160, step=4, verbose=True):
-    """The privileged CEILING: best uniform S chosen SEPARATELY for each lambda (the
-    policy is allowed to know the regime). Returns ({lam: (S, cost)}, mean_cost)."""
+                      seed_base=SEED_BASE, lo=20, hi=160, step=4, per_echelon=False,
+                      rounds=3, verbose=True):
+    """The privileged CEILING: best base-stock chosen SEPARATELY for each lambda (the policy
+    is allowed to know the regime). per_echelon=True coordinate-descends a 4-vector PER lambda
+    -- which matches DRACO's per-echelon structured head, so the ceiling is a TRUE upper bound
+    (otherwise a per-echelon DRACO can beat a uniform 'oracle' and Gap_Recovered exceeds 1).
+    Returns ({lam: (S_vec, cost)}, mean_cost)."""
     env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
-    LamEnv = _make_lambda_env_class(env_class or get_env_class())
     out = {}
     for lam in lambdas:
-        best_s, best_c = None, np.inf
-        for s in range(lo, hi + 1, step):
-            mc = _mean_cost_at_lambda(BaseStockPolicy([float(s)] * 4), lam, episodes, LamEnv, env_cfg, seed_base)
-            if mc < best_c:
-                best_s, best_c = float(s), mc
-        out[lam] = (best_s, best_c)
+        # reuse the bar optimizer on a SINGLE lambda == the regime-aware optimum for that lambda,
+        # in the SAME policy class (uniform or per-echelon) as the bar -> apples-to-apples.
+        S_vec, _per, cost = best_single_fixed_S(
+            [lam], episodes, env_cfg, env_class, seed_base,
+            lo=lo, hi=hi, step=step, per_echelon=per_echelon, rounds=rounds, verbose=False)
+        out[lam] = (S_vec, float(cost))
         if verbose:
-            print(f"    lam={lam:>4g}: S~{best_s:>3.0f}  cost={best_c:8.1f}")
+            print(f"    lam={lam:>4g}: S~[{','.join(f'{x:.0f}' for x in S_vec)}]  cost={cost:8.1f}")
     return out, float(np.mean([c for _, c in out.values()]))
 
 
@@ -481,7 +485,8 @@ def regime_benchmark(lambdas=None, episodes=15, env_cfg=None, env_class=None,
           f"|  {episodes} eps/lambda  |  seed_base={seed_base}")
     print("=" * 72)
     print("per-lambda ORACLE (privileged: knows the regime):")
-    oracle, oracle_mean = per_lambda_oracle(lambdas, episodes, env_cfg, env_class, seed_base)
+    oracle, oracle_mean = per_lambda_oracle(lambdas, episodes, env_cfg, env_class, seed_base,
+                                            per_echelon=per_echelon)
     print(f"  -> oracle mean cost (CEILING, unattainable) = {oracle_mean:.1f}\n")
     bestS, _, fixed_mean = best_single_fixed_S(
         lambdas, episodes, env_cfg, env_class, seed_base, per_echelon=per_echelon)
@@ -492,6 +497,16 @@ def regime_benchmark(lambdas=None, episodes=15, env_cfg=None, env_class=None,
     print(f"  DRACO target: beat {fixed_mean:.0f}, approach {oracle_mean:.0f}.")
     print(f"  -> set in the trainer:  heldout_fixed_ref={fixed_mean:.0f}  "
           f"heldout_oracle_ref={oracle_mean:.0f}")
+    # persist the two numbers so the sweep scripts read them dynamically (no stale hardcoding)
+    try:
+        os.makedirs("results", exist_ok=True)
+        with open("results/baselines_regime.json", "w") as _f:
+            json.dump({"BAR": float(fixed_mean), "CEILING": float(oracle_mean),
+                       "lambdas": [float(l) for l in lambdas],
+                       "per_echelon": bool(per_echelon)}, _f, indent=2)
+        print("  -> wrote results/baselines_regime.json (BAR, CEILING) for the sweep scripts")
+    except OSError as _e:
+        print(f"  (could not write results/baselines_regime.json: {_e})")
     if sterman is not None:
         per = cost_across_lambdas(sterman, lambdas, episodes, env_cfg, env_class, seed_base)
         print(f"  Sterman behavioral floor (mean across lambda) = {np.mean(list(per.values())):.1f}")

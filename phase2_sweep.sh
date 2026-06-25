@@ -9,8 +9,10 @@
 # Usage (5 fresh report seeds; split across pods if you like):
 #   ./run_phase2_c1.sh 10 11 12 13 14
 set -euo pipefail
-set -f   # disable globbing so Hydra list overrides like [8,12,16,20] aren't mangled by bash
-cd /workspace/BeerGame_Project  
+set -f   # disable globbing so Hydra list overrides like [8,12,16,20] survive bash
+source /workspace/venv/bin/activate 2>/dev/null || true   # use the venv from setup_pod.sh
+: "${WANDB_API_KEY:?set WANDB_API_KEY first: export WANDB_API_KEY=... (or run: wandb login)}"
+cd "${REPO:-/workspace/BeerGame_Project}"   # MUST match your git clone dir; override: REPO=/path ./script.sh  
 
 
 # >>>>> PASTE THE LOCKED HPs FROM PHASE 1 HERE (these are the validated defaults as a fallback) <<<<<

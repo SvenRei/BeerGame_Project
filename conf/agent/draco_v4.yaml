@@ -69,7 +69,7 @@ polyak_tau: 0.005         # [v4-INERT] no Polyak target net in v4; kept for back
 hidden_dim: 128
 
 # ===================== training schedule =====================
-batch_episodes: 32
+batch_episodes: 8
 warm_up_episodes: 0
 patience: 3000
 lr_scheduler_step: 2000

@@ -13,8 +13,10 @@
 # 18 configs x the seeds you pass. Parallelize BY SEED across pods:
 #   pod A: ./run_phase1_hpsweep.sh 0     pod B: ... 1     pod C: ... 2
 set -euo pipefail
-set -f   # disable globbing so Hydra list overrides like [8,12,16,20] aren't mangled by bash
-cd /workspace/BeerGame_Project                      # <-- make this consistent across ALL your scripts
+set -f   # disable globbing so Hydra list overrides like [8,12,16,20] survive bash
+source /workspace/venv/bin/activate 2>/dev/null || true   # use the venv from setup_pod.sh
+: "${WANDB_API_KEY:?set WANDB_API_KEY first: export WANDB_API_KEY=... (or run: wandb login)}"
+cd "${REPO:-/workspace/BeerGame_Project}"   # MUST match your git clone dir; override: REPO=/path ./script.sh                      # <-- make this consistent across ALL your scripts
 
 
 VAL="agent.heldout_lambdas=[8,12,16,20]"       # validation split (NOT the C1 test lambdas)

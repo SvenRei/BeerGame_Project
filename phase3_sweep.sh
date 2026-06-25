@@ -18,8 +18,10 @@
 # Usage (SAME seeds as Phase 2 so comm is CRN-paired against the nocomm refs):
 #   ./run_phase3_c2.sh 10 11 12 13 14
 set -euo pipefail
-set -f   # disable globbing so Hydra list overrides like [8,12,16,20] aren't mangled by bash
-cd /workspace/BeerGame_Project  
+set -f   # disable globbing so Hydra list overrides like [8,12,16,20] survive bash
+source /workspace/venv/bin/activate 2>/dev/null || true   # use the venv from setup_pod.sh
+: "${WANDB_API_KEY:?set WANDB_API_KEY first: export WANDB_API_KEY=... (or run: wandb login)}"
+cd "${REPO:-/workspace/BeerGame_Project}"   # MUST match your git clone dir; override: REPO=/path ./script.sh  
 
 
 LOCKED="agent.demand_aux_coef=0.3 agent.z_dim=8 agent.encoder_type=gru"   # from Phase 1
