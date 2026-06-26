@@ -70,3 +70,56 @@ DRACO does not attempt to "beat" the Clark-Scarf optimum. Instead, it tackles th
     Test (H6): evaluate neural vs symbolic vs DAgger-refined symbolic on in-support and out-of-support regimes.
     Report: OOD cost (does symbolic extrapolate ≥ neural?) and fidelity both on neural trajectories and under the symbolic policy's own rollouts (the gap quantifies distribution-shift inflation — the SPID caution).
 
+## DRACO v4 Architecture
+
+DRACO v4 implements a **Centralized Training, Decentralized Execution (CTDE)** architecture. During deployment, agents rely strictly on localized physical observations. During training, a centralized critic leverages the omniscient global state and localized demand beliefs to stabilize the PPO gradient.
+
+```text
+================================================================================
+                      DRACO v4 Multi-Agent Architecture
+================================================================================
+
+      [ ENVIRONMENT: Supply Chain / Beer Game ]
+               |                    |
+               | (Partial View)     | (Omniscient View - TRAINING ONLY)
+               v                    v
++-----------------------------+  +---------------------------------------------+
+| LOCAL OBSERVATION (obs)     |  | GLOBAL STATE (state)                        |
+| Node-specific physical data:|  | Concatenated physical data of ALL nodes     |
+| Inventory, Backlog, Orders  |  | (Retailer + Wholesaler + Dist + Manu)       |
++-----------------------------+  +---------------------------------------------+
+               |                                       |
+               |                                       |
+               v                                       |
+  [ OPTIONAL MSG CHANNEL ]                             |
+  . - - - - - - - - - - - .                            |
+  :  Incoming Msg (msg_in):  if use_comm=True          |
+  :  (Zeros)              :  if use_comm=False         |
+  . - - - - - - - - - - - .                            |
+               |                                       |
+               v                                       v
++-----------------------------+          +-----------------------------+
+| MODULE B: Encoder           |          | MODULE D: Value Critic      |
+| (Action-Free, Causal)       |          | (Centralized MAPPO Critic)  |
+| GRU or CRAFT Transformer    |          | Value = Critic(state, z)    |
++-----------------------------+          +-----------------------------+
+               |                                       ^
+               v                                       |
+       [ DEMAND BELIEF (z) ] --------------------------+ (detached)
+               |
+               +----------------------------------+
+               |                                  |
+               v                                  v
++-----------------------------+  . - - - - - - - - - - - - - - - - - .
+| MODULE A: Structured Actor  |  : [ OPTIONAL ]                      :
+| 1. d_hat = Linear(z)        |  : MODULE C: Message Head            :
+| 2. base = lead*d_hat + safe |  : Out_Msg = DIAL(obs, z) OR d_hat   :
+| 3. corr = tanh(MLP(obs,z,m))|  :                                   :
+| S = softplus(base + corr)   |  :-----> Broadcast via Topology ---->:
++-----------------------------+  . - - - - - - - - - - - - - - - - - .
+               |
+               v
+     [ TARGET BASE-STOCK (S) ]
+               |
+               v
+  Action = max(0, S - Inventory)

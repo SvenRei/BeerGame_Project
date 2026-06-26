@@ -41,10 +41,3 @@ done
 #       --bar 4726 --ceiling 2202 --regime-episodes 20
 #   report mean +/- std of the regime-uncertainty Gap_Recovered over the 5 seeds. The
 #   eval defaults already use the TEST lambdas {6,10,14,18,22}.
-
-# ---------------------------------------------------------------------------------------
-# ARCHITECTURE ABLATION (Study 4 / H3) -- run your run_ablations_sweep.sh, but FIRST add the
-# locked HPs to its BASE_OPTS and use these SAME fresh seeds and TEST refs, so the 2x2
-# (structured/mlp x context/nocontext) is measured against the identical bar. The expected
-# result you already saw locally: only ablate_full crosses the bar; the other three don't.
-# ---------------------------------------------------------------------------------------

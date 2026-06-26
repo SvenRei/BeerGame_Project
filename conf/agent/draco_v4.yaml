@@ -75,6 +75,7 @@ patience: 3000
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5
 trace_every: 0
+heldout_lambdas: [6, 10, 14, 18, 22]   # held-out eval regimes; Phase 1/2 override to the VAL set on the CLI
 
 # ===================== demand-randomisation curriculum = p(T) =====================
 # C1-validated: covers the held-out lambdas {6,10,14,18,22} so the held-out eval tests

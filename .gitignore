@@ -12,6 +12,7 @@ env/
 wandb/
 outputs/
 tests/
+run_logs/
 weights_mappo/
 weights_comm_mappo/
 weights_qmix/
