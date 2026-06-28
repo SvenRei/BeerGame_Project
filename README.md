@@ -130,9 +130,9 @@ python agents/train_draco_v4.py agent=draco_v4 agent.actor_head=structured agent
        agent.demand_aux_coef=0.3 agent.z_dim=8 agent.encoder_type=gru \
        total_episodes=15000 seed=10 agent.algorithm=c1_s10
 
-# 3) EVAL a checkpoint (standard benchmark + C1 table + held-out families)
+# 3) EVAL a checkpoint (standard benchmark + C1 table + held-out families + bullwhip comparison)
 python agents/eval_draco_v4.py --ckpt weights_draco/run_dracov4_<id>/draco_checkpoint_best.pt \
-       --episodes 100 --regime-episodes 20 --families
+       --episodes 100 --regime-episodes 20 --families --bullwhip
 
 # 4) STATISTICS over seeds: dump per-seed costs, then aggregate
 python agents/eval_draco_v4.py --ckpt <ckpt> --dump-c1 results/draco_c1 --dump-c1-episodes 200

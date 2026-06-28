@@ -11,6 +11,13 @@ kl_coef: 1.0e-3            # ELBO KL-to-prior weight
 pred_coef: 1.0            # ELBO demand-reconstruction weight ([FIX 3]: target is RAW demand)
 belief_sample: false
 use_context: true
+# belief_mode (ABLATION #8): encoder (default, the learned BAMDP belief) | ewma | bayes -> the
+# structured head's d_hat comes from a closed-form plug-in rate estimate and the encoder is bypassed
+# and not trained. Isolates whether the learned encoder beats a simple rate estimator.
+belief_mode: encoder
+plugin_prior_mean: 8.0     # plug-in (ewma/bayes) prior mean demand rate
+plugin_prior_strength: 1.0 # bayes plug-in: prior strength in pseudo-periods
+plugin_eta: 0.2            # ewma plug-in: smoothing factor
 
 # ===================== actor head =====================
 # structured = interpretable base-stock head S = softplus(lead*d_hat + safety + corr).
@@ -37,6 +44,9 @@ msg_mode: dhat
 
 # ===================== critic =====================
 critic_uses_belief: true
+# critic_mode (ABLATION #19): centralized (default, CTDE global-state critic) | independent (IPPO:
+# per-agent critic on local obs only, no global state).
+critic_mode: centralized
 n_quantiles: 32           # [v4-INERT] critic is scalar in v4 (value-normalized); kept for
                           # checkpoint/back-compat only -- not read by the live trainer.
 
@@ -49,7 +59,14 @@ corr_l2_coef: 0.0         # safety valve off (raise to ~1e-3 if S won't come DOW
 risk_eta: 0.0
 cvar_alpha: 0.2
 
-# ===================== SRDQN per-agent shaping =====================
+# ===================== SRDQN per-agent reward shaping =====================
+# Each agent's shaped reward is -(own_cost + srdqn_beta * others_cost). This is a CREDIT-ASSIGNMENT
+# choice, and it interacts with the reported objective:
+#   beta = 1.0  -> reward = -(total team cost) for every agent = EXACTLY the evaluation objective
+#                  (team-optimal; the objective-exact setting -- report this in the ablation).
+#   beta < 1.0  -> down-weights others' cost: lower-variance learning signal, but it does NOT
+#                  optimize the reported team cost. 0.5 is the default heuristic.
+# Run the beta ablation (phase_beta_sweep.sh) over {0.0, 0.5, 1.0} and report the sensitivity.
 srdqn_beta: 0.5
 reward_scale: 50.0        # [v4-INERT] v4 uses running value-normalization instead of a fixed
                           # reward_scale; kept for back-compat only -- not read by the trainer.

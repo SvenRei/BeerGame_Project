@@ -32,7 +32,8 @@ def _torch_save(obj, path, _retries=6, _delay=5):
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents.draco_v4 import (
     ADJ, DemandRandomizedBeerGame, make_encoder, make_actor,
-    BaseStockActor, MessageHead, DistributionalCritic, DRACOTrainerV4, DRACORolloutBuffer,
+    BaseStockActor, MessageHead, DistributionalCritic, IndependentCritic, plugin_rate,
+    DRACOTrainerV4, DRACORolloutBuffer,
 )
 from agents.heldout_eval import make_heldout_envs, run_heldout_eval, HELDOUT_LAMBDAS  # held-out-lambda eval (C1 gate)
 from agents.topologies import get_adj                                 # Study-2 comm topology selector
@@ -132,7 +133,7 @@ def main(cfg: DictConfig):
     # Hydra changes the CWD to the run dir, so resolve the path against the repo root (_ROOT).
     heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4726.0)   # BAR     fallback
     heldout_oracle = cfg.agent.get("heldout_oracle_ref", 2202.0)  # CEILING fallback
-    heldout_bayes  = None                                          # analytic Bayes-adaptive rung (the real bar)
+    heldout_bayes  = None                                          # Bayes-adaptive rung: a naive-adaptation FLOOR (bullwhips), logged as a SECONDARY check; the bar is the static BAR
     _refs_path = cfg.agent.get("refs_json", "results/baselines_regime_v2.json")
     if not os.path.isabs(_refs_path):
         _refs_path = os.path.join(_ROOT, _refs_path)
@@ -188,8 +189,17 @@ def main(cfg: DictConfig):
     actors = [make_actor(actor_head, local_dim, z_dim, msg_dim, hidden, max_order, cfg.agent).to(device)
               for _ in range(N)]
     msg_heads = [MessageHead(local_dim, z_dim, msg_dim, hidden).to(device) for _ in range(N)]
-    # critic takes the global state AND the flattened detached belief (N*z_dim).
-    critic = DistributionalCritic(gdim, N * z_dim, hidden, N, n_quant).to(device)
+    # critic: centralized (CTDE: global state + flattened belief) OR independent (IPPO: per-agent
+    # local obs + belief, no global state). Default centralized = the standard DRACO.
+    belief_mode = str(cfg.agent.get("belief_mode", "encoder")).lower()
+    plugin_prior_mean = float(cfg.agent.get("plugin_prior_mean", cfg.agent.get("demand_init", 8.0)))
+    plugin_prior_strength = float(cfg.agent.get("plugin_prior_strength", 1.0))
+    plugin_eta = float(cfg.agent.get("plugin_eta", 0.2))
+    critic_mode = str(cfg.agent.get("critic_mode", "centralized")).lower()
+    if critic_mode == "independent":
+        critic = IndependentCritic(local_dim, z_dim, hidden, N).to(device)
+    else:
+        critic = DistributionalCritic(gdim, N * z_dim, hidden, N, n_quant).to(device)
     trainer = DRACOTrainerV4(encoder, actors, msg_heads, critic, cfg.agent, device, N, adj)
 
     step = cfg.agent.lr_scheduler_step
@@ -239,17 +249,27 @@ def main(cfg: DictConfig):
             obs_hist.append(o_t); msg_hist.append(incoming)
             obs_seq = torch.stack(obs_hist[-craft_max_len:])                      # [t,N,od]
             msg_seq = torch.stack(msg_hist[-craft_max_len:])                      # [t,N,msg]
-            mu, ls, _ = encoder.forward_sequence(obs_seq, msg_seq)
-            z_t = mu[-1]                                                          # [N,z] posterior mean (current belief)
-            if belief_sample:
-                z_t = z_t + torch.randn_like(z_t) * ls[-1].exp()                 # BAMDP: act on a sample
-            z_act = z_t if use_context else torch.zeros_like(z_t)
+            d_hat_override = None
+            if belief_mode == "encoder":
+                mu, ls, _ = encoder.forward_sequence(obs_seq, msg_seq)
+                z_t = mu[-1]                                                      # [N,z] posterior mean (current belief)
+                if belief_sample:
+                    z_t = z_t + torch.randn_like(z_t) * ls[-1].exp()             # BAMDP: act on a sample
+                z_act = z_t if use_context else torch.zeros_like(z_t)
+            else:
+                # belief_mode ablation (#8): zero the encoder belief; d_hat from a plug-in rate over
+                # the last-demand channel (obs[...,3]). Must match the trainer's plugin_rate exactly.
+                z_t = torch.zeros(N, z_dim, device=device)
+                z_act = z_t
+                d_hat_override = plugin_rate(obs_seq[..., 3], belief_mode, plugin_prior_mean,
+                                             plugin_prior_strength, plugin_eta)[-1]   # [N,1]
 
             # base-stock action S (the only stochastic policy output)
             S = torch.zeros(N, 1, device=device)
             logp = torch.zeros(N, 1, device=device)
             for i in range(N):
-                s_mu, s_std = actors[i](o_t[i:i + 1], z_act[i:i + 1], incoming[i:i + 1])
+                dho = d_hat_override[i:i + 1] if d_hat_override is not None else None
+                s_mu, s_std = actors[i](o_t[i:i + 1], z_act[i:i + 1], incoming[i:i + 1], d_hat_override=dho)
                 S_i = s_mu if deterministic else Normal(s_mu, s_std).rsample()
                 logp[i] = Normal(s_mu, s_std).log_prob(S_i).sum()
                 S[i] = S_i                                                       # <-- REQUIRED: write the action
@@ -266,7 +286,10 @@ def main(cfg: DictConfig):
             if use_comm:
                 if msg_mode == "dhat":                                            # d_hat broadcast -> interpretable, msg_dim must be 1
                     for i in range(N):
-                        m_out[i] = actors[i].demand_estimate(z_t[i:i + 1]).reshape(-1) / 100.0
+                        if belief_mode == "encoder":
+                            m_out[i] = actors[i].demand_estimate(z_t[i:i + 1]).reshape(-1) / 100.0
+                        else:
+                            m_out[i] = d_hat_override[i].reshape(-1) / 100.0       # plug-in d_hat broadcast
                 else:
                     for i in range(N):
                         m_out[i] = msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)

@@ -39,7 +39,7 @@ from scipy import stats
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 from agents.draco_v4 import (
-    make_encoder, make_actor, BaseStockActor, MessageHead, DemandRandomizedBeerGame,
+    make_encoder, make_actor, BaseStockActor, MessageHead, DemandRandomizedBeerGame, plugin_rate,
 )
 from agents.topologies import get_adj
 
@@ -110,6 +110,12 @@ class DracoV4Policy:
         enc_cfg = dict(cfg); enc_cfg["craft_max_len"] = self.craft_max_len
         local_dim = env.observation_space("retailer").shape[0]
         self.use_context = cfg.get("use_context", True)
+        # belief_mode (ablation #8): if the checkpoint used a plug-in belief, eval must use it too
+        # (the encoder is untrained in that case), so d_hat matches training.
+        self.belief_mode = str(cfg.get("belief_mode", "encoder")).lower()
+        self.plugin_prior_mean = float(cfg.get("plugin_prior_mean", cfg.get("demand_init", 8.0)))
+        self.plugin_prior_strength = float(cfg.get("plugin_prior_strength", 1.0))
+        self.plugin_eta = float(cfg.get("plugin_eta", 0.2))
 
         # topology routed EXACTLY as the checkpoint was trained
         self.comm_topology = cfg.get("comm_topology", "neighbor")
@@ -159,17 +165,26 @@ class DracoV4Policy:
         self._msg_hist.append(incoming)
         obs_seq = torch.stack(self._obs_hist[-self.craft_max_len:])
         msg_seq = torch.stack(self._msg_hist[-self.craft_max_len:])
-        mu, _, _ = self.encoder.forward_sequence(obs_seq, msg_seq)
-        z_t = mu[-1]
-        z_act = z_t if self.use_context else torch.zeros_like(z_t)
+        d_hat_override = None
+        if self.belief_mode == "encoder":
+            mu, _, _ = self.encoder.forward_sequence(obs_seq, msg_seq)
+            z_t = mu[-1]
+            z_act = z_t if self.use_context else torch.zeros_like(z_t)
+        else:                                            # plug-in belief (ablation #8): match training
+            z_t = torch.zeros(self.N, self.z_dim, device=DEVICE)
+            z_act = z_t
+            d_hat_override = plugin_rate(obs_seq[..., 3], self.belief_mode, self.plugin_prior_mean,
+                                         self.plugin_prior_strength, self.plugin_eta)[-1]   # [N,1]
 
         S = torch.zeros(self.N, 1, device=DEVICE)
         dhat = np.full(self.N, np.nan)
         for i in range(self.N):
-            s_mu, s_std = self.actors[i](o_t[i:i + 1], z_act[i:i + 1], incoming[i:i + 1])
+            dho = d_hat_override[i:i + 1] if d_hat_override is not None else None
+            s_mu, s_std = self.actors[i](o_t[i:i + 1], z_act[i:i + 1], incoming[i:i + 1], d_hat_override=dho)
             S[i] = s_mu if self.deterministic else torch.distributions.Normal(s_mu, s_std).sample()
             if self.has_dhat:
-                dhat[i] = float(self.actors[i].demand_estimate(z_act[i:i + 1]).reshape(-1)[0].item())
+                dhat[i] = (float(d_hat_override[i].item()) if d_hat_override is not None
+                           else float(self.actors[i].demand_estimate(z_act[i:i + 1]).reshape(-1)[0].item()))
 
         m_out = torch.zeros(self.N, self.msg_dim, device=DEVICE)
         if self.use_comm and not self.ablate and (self.msg_mode == "dhat" or self.msg_heads is not None):
@@ -329,8 +344,11 @@ def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS, ba
     if bayes is not None:
         # the HEADLINE comparison: DRACO vs the analytic Bayes-adaptive policy (Scarf/Azoury),
         # not the static base-stock. Bayes_Gap = fraction of the Bayes->oracle headroom recovered.
+        # SECONDARY check ("beats naive adaptation"): Bayes is the single-stage-optimal adaptive
+        # policy, which BULLWHIPS in this multi-echelon cost -> a naive-adaptation FLOOR, not the
+        # headline bar. The headline is Gap_Recovered vs the static BAR + Oracle (above).
         bgap = (bayes - mean_cost) / max(1e-6, bayes - ceiling)
-        bverdict = "BEATS Bayes-adaptive (the real bar)" if mean_cost < bayes else "below Bayes"
+        bverdict = "beats the naive-adaptation floor (Bayes)" if mean_cost < bayes else "below the Bayes floor"
         print(f"    {'vs BAYES':>7}{bayes:>12.1f}   Bayes_Gap={bgap:+.3f}  ({bverdict})")
         out["bayes_gap_recovered"] = bgap
     return out
@@ -358,6 +376,91 @@ def dump_c1(ckpt, episodes, out_dir, lambdas=HELDOUT_LAMBDAS, seed=None):
     print(f"    lambdas {[f'{l:g}' for l in lambdas]}  mean_cost "
           f"{[round(per[float(l)],1) for l in lambdas]}  ({episodes} eps/lambda)")
     return path
+
+
+def _roll_orders_baseline(policy, env, seed):
+    """Roll a baselines.py policy (act(obs, env) -> {agent: [frac]}) and return per-echelon cumulative
+    bullwhip BW_cum = Var(orders)/Var(customer demand) plus total cost. Mirrors the BW_cum definition
+    used for DRACO in run_episode()."""
+    obs, _ = env.reset(seed=seed)
+    policy.reset()
+    orders = {a: [] for a in AGENTS}
+    cust, cost = [], 0.0
+    while True:
+        acts = policy.act(obs, env)
+        for a in AGENTS:
+            orders[a].append(int(np.floor(np.clip(acts[a][0], 0, 1) * env.max_order + 0.5)))
+        obs, _, _, trunc, info = env.step(acts)
+        cust.append(float(env.current_incoming_order["retailer"]))
+        cost += sum(info[a]["local_cost"] for a in AGENTS)
+        if any(trunc.values()):
+            break
+    cv = float(np.var(cust))
+    bw = {a: (float(np.var(orders[a]) / cv) if cv > 1e-9 else float("nan")) for a in AGENTS}
+    return bw, cost
+
+
+def bullwhip_comparison(ckpt, episodes=40, lambdas=HELDOUT_LAMBDAS, refs_json=None, prior_mean=14.0):
+    """FIRST-CLASS bullwhip result (review #13 / the S2 story): order-variance amplification
+    BW_cum = Var(orders)/Var(customer demand) per echelon, for DRACO vs the static base-stock vs the
+    Bayes naive-adaptation floor, on the held-out regimes. A static base-stock is ~bullwhip-free
+    (BW~1); adaptive policies amplify upstream. The question DRACO must answer: can it ADAPT the
+    regime while keeping amplification low (i.e. beat static cost without static's bullwhip)?
+    Static-BAR levels are read from the refs JSON `meta.bar_levels` (single source of truth)."""
+    try:
+        from scripts.baselines import BaseStockPolicy, make_bayes_rung
+    except Exception as e:
+        print(f"\n  bullwhip comparison skipped (import: {type(e).__name__}: {e})")
+        return None
+    bar_levels = None
+    if refs_json and os.path.exists(refs_json):
+        try:
+            bar_levels = json.load(open(refs_json)).get("meta", {}).get("bar_levels")
+        except Exception:
+            bar_levels = None
+
+    def _agg_baseline(make_pol):
+        bws = {a: [] for a in AGENTS}
+        costs = []
+        for lam in lambdas:
+            env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+                                           lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
+            for e in range(episodes):
+                bw, c = _roll_orders_baseline(make_pol(), env, HELDOUT_SEED_BASE + e)
+                for a in AGENTS:
+                    bws[a].append(bw[a])
+                costs.append(c)
+        return {a: float(np.nanmean(bws[a])) for a in AGENTS}, float(np.mean(costs))
+
+    def _agg_draco():
+        bws = {a: [] for a in AGENTS}
+        costs = []
+        for lam in lambdas:
+            env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+                                           lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
+            pol = DracoV4Policy(ckpt, env, ablate=False)
+            for e in range(episodes):
+                r = run_episode(pol, env, HELDOUT_SEED_BASE + e)
+                for a in AGENTS:
+                    bws[a].append(r["bw_cum"][a])
+                costs.append(r["cost"])
+        return {a: float(np.nanmean(bws[a])) for a in AGENTS}, float(np.mean(costs))
+
+    print(f"\n  bullwhip comparison  (BW_cum = Var(orders)/Var(customer demand); review #13, {episodes} eps/lambda)")
+    print(f"    {'policy':<16}" + "".join(f"{('BW_' + a[:4]):>9}" for a in AGENTS) + f"{'mean cost':>11}")
+    rows = {}
+    if bar_levels is not None:
+        bw, c = _agg_baseline(lambda: BaseStockPolicy(bar_levels))
+        rows["static-BAR"] = (bw, c)
+    else:
+        print("    (static-BAR row skipped: no meta.bar_levels in the refs JSON; run baselines.py regime)")
+    rows["Bayes-floor"] = _agg_baseline(lambda: make_bayes_rung(h=H_COST, b=B_COST, prior_mean=prior_mean))
+    rows["DRACO"] = _agg_draco()
+    for name, (bw, c) in rows.items():
+        print(f"    {name:<16}" + "".join(f"{bw[a]:>9.2f}" for a in AGENTS) + f"{c:>11.1f}")
+    print("    (static base-stock is ~bullwhip-free [BW~1]; the Bayes floor amplifies upstream; the")
+    print("     S2 claim is that DRACO adapts the regime while keeping BW_cum low -> 'adapt without bullwhip'.)")
+    return rows
 
 
 def heldout_family_eval(ckpt, episodes=50, mu=12.0, ar1_rhos=(0.0, 0.3, 0.6, 0.9), nb_disps=(2.0, 4.0, 8.0)):
@@ -697,6 +800,9 @@ def main():
     ap.add_argument("--family-mu", type=float, default=12.0, help="held mean demand for the family tests")
     ap.add_argument("--ar1-rhos", nargs="+", type=float, default=[0.0, 0.3, 0.6, 0.9],
                     help="AR(1) autocorrelations to test (the comm-value-vs-rho axis for Study 3)")
+    ap.add_argument("--bullwhip", action="store_true",
+                    help="bullwhip comparison (review #13): order-variance amplification DRACO vs static vs Bayes")
+    ap.add_argument("--bullwhip-episodes", type=int, default=40)
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location=DEVICE, weights_only=False)
@@ -786,6 +892,10 @@ def main():
     if args.families or args.full:
         heldout_family_eval(ckpt, episodes=args.family_episodes, mu=args.family_mu,
                             ar1_rhos=tuple(args.ar1_rhos))
+
+    # ---- bullwhip comparison (review #13: the 'adapt without bullwhip' S2 story) ----
+    if args.bullwhip or args.full:
+        bullwhip_comparison(ckpt, episodes=args.bullwhip_episodes, refs_json=refs_path)
 
     # ---- message analysis (Study 2) ----
     if args.messages or args.full:

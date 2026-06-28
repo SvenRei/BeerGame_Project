@@ -150,6 +150,47 @@ def paired(a, b, alternative="two-sided"):
     return out
 
 
+def adjust_pvalues(pvals, method="holm"):
+    """Multiple-comparison correction over a FAMILY of tests (review #12). Returns
+    (adjusted_pvals, reject_at_0.05), order-preserving. method:
+      'holm' -- Holm-Bonferroni, controls the family-wise error rate (FWER); conservative.
+      'bh'   -- Benjamini-Hochberg, controls the false-discovery rate (FDR); more powerful.
+    Run this across the p-values of all the paired comparisons you report in one study (e.g. one per
+    comm topology, per demand family, or per ablation), NOT per-comparison in isolation."""
+    p = np.asarray(pvals, float)
+    n = p.size
+    if n == 0:
+        return np.array([]), np.array([], dtype=bool)
+    order = np.argsort(p)
+    sp = p[order]
+    adj_sorted = np.empty(n)
+    if method == "holm":
+        running = 0.0
+        for i in range(n):                               # ascending; multiplier (n-i), monotone
+            running = max(running, (n - i) * sp[i])
+            adj_sorted[i] = min(running, 1.0)
+    elif method == "bh":
+        running = 1.0
+        for i in range(n - 1, -1, -1):                   # descending; p*(n/(i+1)), monotone
+            running = min(running, sp[i] * n / (i + 1))
+            adj_sorted[i] = min(running, 1.0)
+    else:
+        raise ValueError("method must be 'holm' or 'bh'")
+    adj = np.empty(n)
+    adj[order] = adj_sorted
+    return adj, adj <= 0.05
+
+
+def compare_many(named_pvals, method="holm"):
+    """Apply `adjust_pvalues` to a {name: raw_p} dict of paired comparisons. Returns
+    {name: {raw, adjusted, reject}} corrected across the whole family. Use after running one
+    paired() per topology / family / ablation, to avoid the multiple-comparisons inflation (#12)."""
+    names = list(named_pvals)
+    adj, rej = adjust_pvalues([named_pvals[n] for n in names], method=method)
+    return {n: {"raw": float(named_pvals[n]), "adjusted": float(adj[i]), "reject": bool(rej[i])}
+            for i, n in enumerate(names)}
+
+
 # ==============================================================================
 # The C1 report
 # ==============================================================================
@@ -265,7 +306,9 @@ def print_report(rep):
         verdict = "DRACO significantly below Bayes" if vb["beats_bayes_ci"] else \
                   "not significant (CI includes 0)"
         print("-" * 78)
-        print(f"  DRACO vs Bayes-adaptive (paired over seeds, +=DRACO cheaper):")
+        print(f"  [SECONDARY] DRACO vs the Bayes naive-adaptation FLOOR (paired over seeds, +=DRACO cheaper).")
+        print(f"  (Headline is Gap_Recovered vs the static BAR + Oracle above; Bayes bullwhips in the")
+        print(f"   per-stage cost, so this is a 'beats naive adaptation' check, not the bar.)")
         print(f"    mean(Bayes - DRACO) = {vb['mean_diff']:+.1f}   95% CI {_ci1(vb['diff_ci'])}  -> {verdict}")
         print(f"    Bayes-anchored gap  = {vb['bayes_gap_mean']:+.3f}   "
               f"(1 = matches Bayes-vs-oracle headroom fully)")
@@ -378,6 +421,16 @@ def _selftest():
     pp = performance_profile([0.0, 0.5, 1.0], taus=[0.0, 0.6, 1.1])
     assert pp["frac"][0] == 1.0 and abs(pp["frac"][1] - (1 / 3)) < 1e-9 and pp["frac"][2] == 0.0
     print("  E) iqm + performance_profile primitives  PASS")
+
+    # F) multiple-comparison correction: adjusted >= raw; Holm (FWER) >= BH (FDR) elementwise.
+    raw = [0.01, 0.01, 0.04]
+    holm, _ = adjust_pvalues(raw, "holm")
+    bh, _ = adjust_pvalues(raw, "bh")
+    assert np.all(holm >= np.asarray(raw) - 1e-12) and np.all(bh >= np.asarray(raw) - 1e-12)
+    assert np.all(holm >= bh - 1e-12)                          # Holm is the more conservative
+    cm = compare_many({"a": 0.001, "b": 0.20}, "holm")
+    assert cm["a"]["reject"] and not cm["b"]["reject"]
+    print("  F) multiple-comparison (Holm/BH) correction  PASS")
     print("\nc1_stats self-test PASS")
 
 

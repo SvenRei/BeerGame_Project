@@ -64,11 +64,13 @@ if have torch && have wandb && have hydra; then
   run "train: AR(1) family + dhat comm"            "$PY" agents/train_draco_v4.py $C agent.actor_head=structured agent.dr_mode=family 'agent.dr_families=[ar1]' agent.ar1_rho_lo=0.6 agent.ar1_rho_hi=0.6 agent.use_comm=true agent.msg_mode=dhat agent.msg_dim=1 agent.algorithm=smoke_ar1
   run "train: risk on (CVaR path)"                 "$PY" agents/train_draco_v4.py $C agent.actor_head=structured agent.risk_eta=0.2 agent.algorithm=smoke_risk
   run "train: canonical cost variant"             "$PY" agents/train_draco_v4.py $C agent.actor_head=structured env.penalty_at_retailer_only=true agent.algorithm=smoke_canon
+  run "train: belief plug-in (ewma, ablation #8)" "$PY" agents/train_draco_v4.py $C agent.actor_head=structured agent.belief_mode=ewma agent.algorithm=smoke_belief
+  run "train: IPPO independent critic (#19)"       "$PY" agents/train_draco_v4.py $C agent.actor_head=structured agent.critic_mode=independent agent.algorithm=smoke_ippo
 
   CKPT="$(ls -t weights_draco/*/draco_checkpoint_best.pt 2>/dev/null | head -1)"
   if [ -n "$CKPT" ]; then
     echo "   (using checkpoint: $CKPT)"
-    run "eval: standard + regime(C1) + families"  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --episodes 3 --regime-episodes 2 --families --family-episodes 2 --ar1-rhos 0.0 0.6
+    run "eval: standard + regime(C1) + families + bullwhip"  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --episodes 3 --regime-episodes 2 --families --family-episodes 2 --ar1-rhos 0.0 0.6 --bullwhip --bullwhip-episodes 2
     run "eval: dump-c1 producer"                  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --dump-c1 results/smoke_c1 --dump-c1-episodes 2 --seed 0
     run "c1_stats report (needs refs json)"       bash -c "[ -f results/baselines_regime_v2.json ] && \"$PY\" scripts/c1_stats.py report --draco-dir results/smoke_c1 || echo '(skip: run baselines.py regime first)'"
     run "distill on real ckpt (linear, 1 DAgger round)" "$PY" scripts/distill_symbolic.py --ckpt "$CKPT" --backend linear --dagger-rounds 1 --bc-episodes 3 --dagger-episodes 2 --eval-episodes 3 --fidelity-episodes 2

@@ -115,6 +115,29 @@ def _causal_mask(T, device):
     return torch.triu(torch.full((T, T), float("-inf"), device=device), diagonal=1)
 
 
+def plugin_rate(dseq, mode="ewma", prior_mean=8.0, prior_strength=1.0, eta=0.2):
+    """Closed-form CAUSAL demand-rate estimate from a last-demand sequence (the belief_mode ablation,
+    review #8). dseq: [T, N] of realized last_demand -> [T, N, 1] running rate estimate at each step.
+      mode='bayes' : Gamma-Poisson posterior mean (a0 + sum_{<=t} d) / (b0 + t).
+      mode='ewma'  : exponentially-smoothed mean, smoothing eta.
+    This REPLACES the learned encoder's d_hat to test whether the encoder is worth its machinery."""
+    d = dseq.clamp(min=0.0)
+    T = d.size(0)
+    if mode == "bayes":
+        a0 = float(prior_mean) * float(prior_strength)
+        b0 = float(prior_strength)
+        csum = torch.cumsum(d, dim=0)
+        cnt = torch.arange(1, T + 1, device=d.device, dtype=d.dtype).unsqueeze(-1)
+        r = (a0 + csum) / (b0 + cnt)
+    else:  # ewma (causal)
+        r = torch.empty_like(d)
+        prev = torch.full((d.size(1),), float(prior_mean), device=d.device, dtype=d.dtype)
+        for t in range(T):
+            prev = (1.0 - eta) * prev + eta * d[t]
+            r[t] = prev
+    return r.unsqueeze(-1)
+
+
 # ==============================================================================
 # Module E -- demand randomization (training only; env file untouched)
 # ==============================================================================
@@ -279,7 +302,7 @@ class BaseStockActor(nn.Module):
         nn.init.constant_(self.s_mu.bias, _inv_softplus(s_bias_init))
         self._last_corr = None   # MLP head has no structural correction term
 
-    def forward(self, obs, z, incoming):
+    def forward(self, obs, z, incoming, d_hat_override=None):  # d_hat_override ignored (no d_hat in the MLP head)
         f = self.trunk(torch.cat([F.relu(self.obs_enc(obs / 100.0)), z, incoming], dim=-1))
         s_mu = F.softplus(self.s_mu(f))
         s_std = self.s_logstd.exp().clamp(1e-3, 5.0)
@@ -341,12 +364,15 @@ class BaseStockActorStructured(nn.Module):
         self.s_logstd = nn.Parameter(torch.zeros(1) + s_logstd_init)
         self._last_corr = None   # exposed for optional corr_l2 regularization in the trainer
 
-    def demand_estimate(self, z):
-        """Belief -> non-negative demand estimate. Grounded by the trainer aux loss."""
+    def demand_estimate(self, z, override=None):
+        """Belief -> non-negative demand estimate. Grounded by the trainer aux loss. If `override`
+        is given (the belief_mode plug-in rate), use it directly and ignore the encoder belief."""
+        if override is not None:
+            return override
         return F.softplus(self.d_head(z))                         # [.,1]
 
-    def forward(self, obs, z, incoming):
-        d_hat = self.demand_estimate(z)
+    def forward(self, obs, z, incoming, d_hat_override=None):
+        d_hat = self.demand_estimate(z, d_hat_override)
         lead = F.softplus(self.log_lead)
         safety = F.softplus(self.log_safety)
         base = lead * d_hat + safety                              # base-stock target level
@@ -468,6 +494,26 @@ class ValueCritic(nn.Module):
 DistributionalCritic = ValueCritic
 
 
+class IndependentCritic(nn.Module):
+    """IPPO critic (review #19): each agent values its OWN local obs (+ detached belief), with NO
+    access to the global state -- i.e. NOT CTDE. A shared per-agent MLP applied independently.
+    forward(obs [B,N,obs_dim], belief [B,N,z]) -> [B,N], same output contract as ValueCritic so the
+    trainer can swap them. Selected with critic_mode='independent'."""
+    def __init__(self, obs_dim, z_dim, hidden, n_agents, **_):
+        super().__init__()
+        self.n_agents = n_agents
+        self.net = nn.Sequential(nn.Linear(obs_dim + z_dim, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+
+    def forward(self, obs, belief):
+        # obs [B,N,od], belief [B,N,z] (DETACHED by caller). Per-agent value from local info only.
+        x = torch.cat([obs / 100.0, belief], dim=-1)
+        return self.net(x).squeeze(-1)                 # [B, N]
+
+    def value(self, obs, belief):
+        return self.forward(obs, belief)
+
+
 # ==============================================================================
 # Rollout buffer (one per episode). Stores PER-AGENT raw local costs (shaping
 # applied in the trainer so beta is a single config knob) and the S-action
@@ -525,6 +571,19 @@ class DRACOTrainerV4:
         self.order_cap_coef = float(cfg.get("order_cap_coef", 0.0))
         self.corr_l2_coef = float(cfg.get("corr_l2_coef", 0.0))
 
+        # --- ablation flags (defaults reproduce the standard DRACO exactly) ---
+        # belief_mode: 'encoder' (default, the learned BAMDP belief) | 'ewma' | 'bayes' -> the
+        #   structured head's d_hat comes from a closed-form plug-in rate estimate, the encoder is
+        #   zeroed and not trained (the encoder-value ablation, review #8).
+        # critic_mode: 'centralized' (default, CTDE global-state critic) | 'independent' (IPPO:
+        #   per-agent critic on local obs only, review #19).
+        self.belief_mode = str(cfg.get("belief_mode", "encoder")).lower()
+        self.critic_mode = str(cfg.get("critic_mode", "centralized")).lower()
+        self.z_dim = int(getattr(encoder, "z_dim", cfg.get("z_dim", 8)))
+        self.plugin_prior_mean = float(cfg.get("plugin_prior_mean", cfg.get("demand_init", 8.0)))
+        self.plugin_prior_strength = float(cfg.get("plugin_prior_strength", 1.0))
+        self.plugin_eta = float(cfg.get("plugin_eta", 0.2))
+
         # [CORR-B] value-target normalizer replaces reward_scale (no longer read).
         self.ret_norm = RunningNorm()
 
@@ -552,9 +611,16 @@ class DRACOTrainerV4:
         zc = z.reshape(T, -1)
         return zc if self.critic_uses_belief else torch.zeros_like(zc)
 
+    # ---- critic inputs: global state (CTDE) or local obs (IPPO) ----
+    def _critic_inputs(self, d):
+        if self.critic_mode == "independent":          # IPPO: each agent sees only its own obs+belief
+            bel = d["z"] if self.critic_uses_belief else torch.zeros_like(d["z"])
+            return d["obs"], bel                       # [T,N,od], [T,N,z]
+        return d["g"], d["zc"]                          # CTDE: global state, flattened belief
+
     # ---- de-normalized critic value for GAE (critic predicts a unit-scale value) ----
-    def _critic_value(self, g, zc):
-        return self.critic(g, zc) * self.ret_norm.std + self.ret_norm.mean      # [T,N]
+    def _critic_value(self, d):
+        return self.critic(*self._critic_inputs(d)) * self.ret_norm.std + self.ret_norm.mean   # [T,N]
 
     # ---- finite-horizon GAE with 0-bootstrap at truncation (critic is time-aware) ----
     def _gae(self, rew, val, done):
@@ -599,9 +665,16 @@ class DRACOTrainerV4:
         # belief + advantages (baseline = ONLINE critic, de-normalized) [CORR-C: no target net]
         with torch.no_grad():
             for d in E:
-                d["z"] = self._encode_belief(d["obs"], d["msg_in"])
+                if self.belief_mode == "encoder":
+                    d["z"] = self._encode_belief(d["obs"], d["msg_in"])
+                    d["dhat"] = None
+                else:
+                    # belief_mode ablation: zero the encoder belief; d_hat comes from a plug-in rate.
+                    d["z"] = torch.zeros(d["obs"].size(0), N, self.z_dim, device=dev)
+                    d["dhat"] = plugin_rate(d["obs"][..., 3], self.belief_mode, self.plugin_prior_mean,
+                                            self.plugin_prior_strength, self.plugin_eta)   # [T,N,1]
                 d["zc"] = self._zero_belief(d["z"])
-                V = self._critic_value(d["g"], d["zc"])                  # [T,N] de-normalized
+                V = self._critic_value(d)                                # [T,N] de-normalized
                 done_t = d["done"].squeeze(-1)
                 adv = torch.stack([self._gae(d["rew"][:, i], V[:, i], done_t) for i in range(N)], dim=1)
                 d["V"], d["adv"] = V, adv
@@ -637,7 +710,7 @@ class DRACOTrainerV4:
             self.critic_opt.zero_grad()
             closs = 0.0
             for d in E:
-                v_norm = self.critic(d["g"], d["zc"])                              # [T,N]
+                v_norm = self.critic(*self._critic_inputs(d))                      # [T,N]
                 target_norm = ((d["vtarget"] - rn_mean) / rn_std).detach()
                 loss = F.mse_loss(v_norm, target_norm) / len(E)
                 loss.backward(); closs += loss.item()
@@ -654,7 +727,7 @@ class DRACOTrainerV4:
         #               (FIX 3: no /100), so d_hat lands on the right scale for the base-stock head.
         #   kl        : pull the latent toward a unit Gaussian prior (the "variational" regularizer)
         #               -> keeps z smooth/compact; kl_coef is the information-bottleneck weight.
-        for _ in range(self.k_epochs):
+        for _ in range(self.k_epochs if self.belief_mode == "encoder" else 0):   # skip if plug-in belief
             self.enc_opt.zero_grad()
             eloss = 0.0
             for d in E:
@@ -677,7 +750,10 @@ class DRACOTrainerV4:
                 z = d["z"]; z_act = z if self.use_context else torch.zeros_like(z)
                 if self.use_comm:
                     if self.msg_mode == "dhat":     # broadcast detached d_hat: message is a readout, no DIAL gradient
-                        m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() / 100.0 for i in range(N)], dim=1)
+                        if self.belief_mode == "encoder":
+                            m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() / 100.0 for i in range(N)], dim=1)
+                        else:
+                            m = (d["dhat"].detach() / 100.0)              # [T,N,1] plug-in d_hat broadcast
                     else:
                         m = torch.stack([self.msg_heads[i](d["obs"][:, i], z[:, i]) for i in range(N)], dim=1)
                     # route messages along the topology: incoming[i] = sum_j ADJ[i,j] * msg[j]
@@ -696,7 +772,8 @@ class DRACOTrainerV4:
                     # new/old probability. We push ratio in the direction of the advantage A,
                     # but CLIP it to [1-eps, 1+eps] so a single update can't move the policy too
                     # far (the core PPO trust-region trick). entropy term encourages exploration.
-                    s_mu, s_std = self.actors[i](d["obs"][:, i], z_act[:, i], incoming[:, i])
+                    dho = d["dhat"][:, i] if d.get("dhat") is not None else None   # plug-in d_hat (belief_mode)
+                    s_mu, s_std = self.actors[i](d["obs"][:, i], z_act[:, i], incoming[:, i], d_hat_override=dho)
                     logp = Normal(s_mu, s_std).log_prob(d["S_act"][:, i]).sum(-1, keepdim=True)
                     ratio = torch.exp(logp - d["old_logp"][:, i])          # pi_new / pi_old
                     A = d["adv"][:, i].unsqueeze(-1)
@@ -706,8 +783,9 @@ class DRACOTrainerV4:
                     loss = loss - torch.min(surr1, surr2).mean() - self.entropy_coef * ent   # maximize -> minimize negative
                     if self.s_smooth_coef > 0 and s_mu.size(0) > 1:
                         loss = loss + self.s_smooth_coef * (s_mu[1:] - s_mu[:-1]).abs().mean()
-                    if self.demand_aux_coef > 0 and hasattr(self.actors[i], "demand_estimate"):
-                        d_hat = self.actors[i].demand_estimate(z_act[:, i])
+                    if (self.demand_aux_coef > 0 and self.belief_mode == "encoder"
+                            and hasattr(self.actors[i], "demand_estimate")):
+                        d_hat = self.actors[i].demand_estimate(z_act[:, i])      # grounds the ENCODER only
                         loss = loss + self.demand_aux_coef * F.mse_loss(d_hat, d["dtgt"][:, i])
                     # --- ordering safety valves (OFF by default) ---
                     if self.order_cap_coef > 0:

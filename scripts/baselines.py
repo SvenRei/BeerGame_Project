@@ -22,10 +22,23 @@ POLICIES you run ON the env (editable like the agents):
   BayesPoissonPolicy       : per-stage Gamma-Poisson conjugate belief on the demand rate ->
                       base-stock at the critical fractile of the negative-binomial predictive
                       over the protection interval. Bayes-OPTIMAL at the retailer (Poisson
-                      demand; Scarf 1959, Azoury 1985); a strong HEURISTIC upstream (whose
-                      incoming ORDER stream is not Poisson). This is the comparator that makes
-                      the C1 "regime inference" claim meaningful -- DRACO must beat THIS, not a
-                      static base-stock.
+                      demand; Scarf 1959, Azoury 1985); a HEURISTIC upstream (whose incoming
+                      ORDER stream is not Poisson).
+                      FRAMING (important -- read before reporting): this is the single-stage-
+                      optimal adaptive policy, but in the multi-echelon penalty-at-EVERY-stage
+                      cost it BULLWHIPS (changing its order-up-to level injects order variance)
+                      and is typically WORSE than the static BAR. So report it as a NAIVE-
+                      ADAPTATION FLOOR, NOT "the bar to beat." The headline comparators are the
+                      static BAR (bullwhip-free, the hard target) and the per-lambda Oracle;
+                      DRACO-vs-Bayes is the SECONDARY "beats naive adaptation" check. (Under the
+                      CANONICAL retailer-only cost the textbook ordering Bayes < BAR is more
+                      likely to hold.) Use make_bayes_rung() (retailer-Bayes + adaptive upstream)
+                      for the reported rung.
+                      SPEC (what the policy knows): Gamma prior centred at the TRAINING-support
+                      mean (prior_mean); updates the rate from each period's observed demand;
+                      critical-fractile order-up-to over protection interval tau; finite-horizon
+                      with no terminal correction; retailer sees true customer demand, upstream
+                      stages see only their own (amplified) incoming order stream.
 
   StermanPolicy            : Sterman (1989) anchoring-and-adjustment heuristic. The behavioral
                       bullwhip baseline / floor.
@@ -756,11 +769,15 @@ def per_lambda_oracle_levels(lambdas, episodes=80, env_cfg=None, env_class=None,
 def regime_benchmark(lambdas=None, select_episodes=80, eval_episodes=200, env_cfg=None,
                      env_class=None, tau=None, prior_mean=14.0, bar_per_echelon=False,
                      out_path="results/baselines_regime_v2.json", sterman=None, verbose=True):
-    """The FOUR-rung, leakage-free C1 ladder:
-        static BAR  <  Adaptive  <=  Bayes  <=  per-lambda Oracle
-    Levels (BAR, Oracle) are SELECTED on SELECT_SEED_BASE; ALL rungs are REPORTED on
-    EVAL_SEED_BASE (== the DRACO held-out seeds). DRACO must BEAT Bayes (the analytic
-    Bayes-adaptive rung) and APPROACH Oracle. Writes per-lambda curves to JSON for c1_stats.py
+    """The FOUR-rung, leakage-free C1 ladder. The TEXTBOOK ordering by cost is
+        Oracle <= Bayes <~ Adaptive <= static BAR
+    and holds under the CANONICAL retailer-only cost (penalty_at_retailer_only=True). Under the
+    DEFAULT penalty-at-EVERY-stage cost, the adaptive rungs (Adaptive, Bayes) BULLWHIP and can
+    EXCEED the static BAR -- this is expected (see S2), not a bug. So the HEADLINE comparators are
+    the static BAR (bullwhip-free, the hard target) + the per-lambda Oracle: DRACO must BEAT the
+    static BAR and APPROACH the Oracle; DRACO-vs-Bayes is a SECONDARY 'beats naive adaptation'
+    check. Levels (BAR, Oracle) are SELECTED on SELECT_SEED_BASE; ALL rungs are REPORTED on
+    EVAL_SEED_BASE (== the DRACO held-out seeds). Writes per-lambda curves to JSON for c1_stats.py
     and the trainer/eval ref loader."""
     lambdas = [float(l) for l in (HELDOUT_LAMBDAS if lambdas is None else lambdas)]
     env_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
@@ -799,14 +816,14 @@ def regime_benchmark(lambdas=None, select_episodes=80, eval_episodes=200, env_cf
         for name in ("BAR_static", "Adaptive", "Bayes", "Oracle"):
             row = "".join(f"{rungs[name][l]:>12.1f}" for l in lambdas)
             print(f"  {name:<14}{row}{means[name]:>12.1f}")
-        print(f"\n  Static headroom (BAR-Oracle)    = {means['BAR_static'] - means['Oracle']:.1f}")
-        print(f"  Bayesian headroom (Bayes-Oracle) = {means['Bayes'] - means['Oracle']:.1f}  "
-              f"<- the headroom DRACO must capture")
-        print(f"  DRACO targets: BEAT Bayes={means['Bayes']:.0f} (the real bar), "
-              f"APPROACH Oracle={means['Oracle']:.0f}.")
-        if not (means["Oracle"] <= means["Bayes"] + 1e-6):
-            print("  [WARN] Oracle > Bayes at the mean: the static oracle is NOT the per-lambda "
-                  "optimum (finite-horizon effect?). Re-check (M3) before trusting Gap<=1.")
+        print(f"\n  Headroom DRACO must capture (BAR-Oracle) = {means['BAR_static'] - means['Oracle']:.1f}")
+        print(f"  Bayes - BAR = {means['Bayes'] - means['BAR_static']:+.1f}  "
+              f"(>0 = naive adaptation BULLWHIPS above the static bar; expected in the per-stage cost)")
+        print(f"  DRACO targets: BEAT static BAR={means['BAR_static']:.0f} (the real bar) and "
+              f"APPROACH Oracle={means['Oracle']:.0f};  Bayes={means['Bayes']:.0f} is the naive-adaptation FLOOR.")
+        if not (means["Oracle"] <= means["BAR_static"] + 1e-6):
+            print("  [WARN] Oracle > BAR: the per-lambda oracle should be the cheapest rung; "
+                  "re-check the oracle optimization (selection seeds / grid).")
         if sterman is not None:
             per = cost_across_lambdas(sterman, lambdas, eval_episodes, env_cfg, env_class, EVAL_SEED_BASE)
             print(f"  Sterman behavioral floor (mean) = {np.mean(list(per.values())):.1f}")
