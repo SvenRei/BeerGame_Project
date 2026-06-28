@@ -30,6 +30,7 @@ Usage:
 """
 import os
 import sys
+import json
 import argparse
 import numpy as np
 import torch
@@ -51,6 +52,38 @@ HELDOUT_LAMBDAS = [6.0, 10.0, 14.0, 18.0, 22.0]
 ENV_BASE = {"horizon": 50, "max_order": 100}
 H_COST = 0.5     # holding cost/unit/week -- MUST match the env/config (config.yaml: holding_cost)
 B_COST = 1.0     # backorder cost/unit/week -- MUST match the env/config (config.yaml: backorder_cost)
+
+# ==============================================================================
+# READING GUIDE -- what this script computes and which question each part answers.
+#
+# It loads a trained checkpoint into DracoV4Policy (topology rebuilt from the ckpt so messages
+# route exactly as trained), rolls deterministic episodes, and prints:
+#
+#   * STANDARD BENCHMARK (per regime) -- mean/CVaR cost, bullwhip, service, fill, jitter, and the
+#     zero-message "comm value" (cost change when messages are ablated, paired Wilcoxon).
+#   * REGIME-UNCERTAINTY (C1)  -> regime_uncertainty(): per-lambda cost + Gap_Recovered vs the
+#     BAR/Oracle/Bayes references. THE headline table. (Study 1/2)
+#   * HELD-OUT-FAMILY eval     -> heldout_family_eval(): AR(1)/NegBin distributional shift vs the
+#     family-appropriate optimum (AR1-opt / Bayes). (M2)  [--families]
+#   * MESSAGE / BELIEF DIAGNOSTICS (Study 3, comm checkpoints only): does the channel carry the
+#     demand signal and does it help upstream? -> belief_calibration (positive signalling: is d_hat
+#     a faithful regime readout?), adaptation_speed (does comm converge beliefs faster?),
+#     message_responsiveness (positive listening: dS/d(message) -- does the receiver ACT on content?),
+#     comm_value_decomposition (per-stage bullwhip/cost split + upstream forecast-error delta).
+#   * PRODUCER mode -> dump_c1(): writes per-seed {lambda: cost} for scripts/c1_stats.py.  [--dump-c1]
+#
+# TWO SEED SPACES (do not conflate):
+#   SEED_BASE=2000          -> the standard-benchmark/message rollouts (their own held-out block).
+#   HELDOUT_SEED_BASE=1e5   -> the C1 / family rollouts; == baselines.py SEED_BASE, so DRACO and the
+#                              reference rungs are scored on the SAME demand draws (common random numbers).
+#
+# OM METRIC GLOSSARY (per-stage dashboard):
+#   BW_loc  = Var(orders)/Var(own incoming)            local order-variance amplification
+#   BW_cum  = Var(orders)/Var(CUSTOMER demand)         cumulative bullwhip vs the true source (Lee/Chen 2000)
+#   NSAmp   = Var(net stock)/Var(customer demand)      net-stock amplification (Disney-Towill 2003)
+#   alpha   = P(no backlog this step)                  Type-1 / cycle service level
+#   beta    = demand_met / demand                      Type-2 / fill rate
+# ==============================================================================
 
 
 def _safe_ratio(num, den):
@@ -272,9 +305,10 @@ def evaluate(policy, env, episodes, trace=False):
 # ==============================================================================
 # Regime-uncertainty table (C1): per-lambda cost + Gap_Recovered vs BAR/CEILING
 # ==============================================================================
-def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS):
-    print(f"\n  regime-uncertainty (C1)   BAR={bar:.0f}  CEILING={ceiling:.0f}   "
-          f"[{episodes} eps/lambda, CRN seeds {HELDOUT_SEED_BASE}+]")
+def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS, bayes=None):
+    print(f"\n  regime-uncertainty (C1)   BAR={bar:.0f}  CEILING={ceiling:.0f}"
+          + (f"  BAYES={bayes:.0f}" if bayes is not None else "")
+          + f"   [{episodes} eps/lambda, CRN seeds {HELDOUT_SEED_BASE}+]")
     print(f"    {'lambda':>7}{'mean cost':>12}{'S_mean':>9}")
     per = {}
     for lam in lambdas:
@@ -291,7 +325,84 @@ def regime_uncertainty(ckpt, episodes, bar, ceiling, lambdas=HELDOUT_LAMBDAS):
     gap = (bar - mean_cost) / max(1e-6, bar - ceiling)
     verdict = "BEATS the fixed bar (C1)" if gap > 0 else "below the fixed bar (no C1 yet)"
     print(f"    {'MEAN':>7}{mean_cost:>12.1f}   Gap_Recovered={gap:+.3f}  ({verdict})")
-    return {"per_lambda": per, "mean_cost": mean_cost, "gap_recovered": gap}
+    out = {"per_lambda": per, "mean_cost": mean_cost, "gap_recovered": gap, "bayes": bayes}
+    if bayes is not None:
+        # the HEADLINE comparison: DRACO vs the analytic Bayes-adaptive policy (Scarf/Azoury),
+        # not the static base-stock. Bayes_Gap = fraction of the Bayes->oracle headroom recovered.
+        bgap = (bayes - mean_cost) / max(1e-6, bayes - ceiling)
+        bverdict = "BEATS Bayes-adaptive (the real bar)" if mean_cost < bayes else "below Bayes"
+        print(f"    {'vs BAYES':>7}{bayes:>12.1f}   Bayes_Gap={bgap:+.3f}  ({bverdict})")
+        out["bayes_gap_recovered"] = bgap
+    return out
+
+
+def dump_c1(ckpt, episodes, out_dir, lambdas=HELDOUT_LAMBDAS, seed=None):
+    """Producer for c1_stats: write {lambda: mean_cost} for THIS checkpoint to out_dir/seed{S}.json.
+    Scored on the EVAL seeds (HELDOUT_SEED_BASE+e) == the seeds baselines.py reports the rungs on,
+    so DRACO and the references are CRN-comparable. S defaults to the checkpoint's training seed.
+    Run this once per Phase-2 checkpoint, then `python scripts/c1_stats.py report`."""
+    if seed is None:
+        seed = ckpt.get("config", {}).get("seed", 0)
+    per = {}
+    for lam in lambdas:
+        env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+                                       lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
+        pol = DracoV4Policy(ckpt, env, ablate=False)
+        costs = [run_episode(pol, env, HELDOUT_SEED_BASE + e)["cost"] for e in range(episodes)]
+        per[float(lam)] = float(np.mean(costs))
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"seed{int(seed)}.json")
+    with open(path, "w") as f:
+        json.dump(per, f, indent=2)
+    print(f"\n  [dump-c1] wrote {path}")
+    print(f"    lambdas {[f'{l:g}' for l in lambdas]}  mean_cost "
+          f"{[round(per[float(l)],1) for l in lambdas]}  ({episodes} eps/lambda)")
+    return path
+
+
+def heldout_family_eval(ckpt, episodes=50, mu=12.0, ar1_rhos=(0.0, 0.3, 0.6, 0.9), nb_disps=(2.0, 4.0, 8.0)):
+    """M2.4 -- held-out-FAMILY eval (the distributional-shift test the 'robustness' name promises).
+    Scores DRACO on AR(1)-rho and NegBin-dispersion demand against the FAMILY-APPROPRIATE optimum:
+      * AR(1) rows -> the MMFE/AR(1)-optimal base-stock (AR1BaseStockPolicy) with the env's rho;
+      * NegBin rows -> the Gamma-Poisson Bayes policy (NegBin IS the Gamma-Poisson predictive, so
+        Bayes is its correct model).
+    Using the right optimum per family is essential: the Gamma-Poisson Bayes rung is NOT optimal under
+    autocorrelation, so 'beats Bayes' on AR(1) would be a category error. CRN seeds match baselines.py."""
+    try:
+        from scripts.demand_families import make_demand_family_envs, make_heldout_family_envs
+        from scripts.baselines import (AdaptiveForecastPolicy, make_ar1_rung, make_bayes_rung,
+                                        rollout as bl_rollout)
+    except Exception as e:
+        print(f"\n  held-out-family eval skipped (import: {type(e).__name__}: {e})")
+        return None
+    AR1, NegBin, _ = make_demand_family_envs(BeerGameParallelEnv)
+    fcfg = {**ENV_BASE, "holding_cost": H_COST, "backorder_cost": B_COST}
+    envs = make_heldout_family_envs(AR1, NegBin, fcfg, ar1_rhos=ar1_rhos, nb_disps=nb_disps, mu=mu)
+    print(f"\n  held-out-FAMILY eval (distributional shift, mean~{mu:g}, {episodes} eps/family, CRN)")
+    print(f"    {'family':<16}{'DRACO':>10}{'Optimal*':>10}{'Adaptive':>10}{'vs Opt':>9}  *comparator")
+    out = {}
+    for name, env in envs.items():
+        cfg = env.config                                  # read the family params off the env
+        fam = cfg.get("family")
+        pol = DracoV4Policy(ckpt, env, ablate=False)
+        d = [run_episode(pol, env, HELDOUT_SEED_BASE + e)["cost"] for e in range(episodes)]
+        if fam == "ar1":                                  # MMFE/AR(1)-optimal at retailer + adaptive upstream
+            opt = make_ar1_rung(mu=cfg.get("ar1_mu", mu), rho=cfg.get("ar1_rho", 0.0),
+                                sigma=cfg.get("ar1_sigma", 3.0), h=H_COST, b=B_COST)
+            opt_name = "AR1-opt"
+        else:                                             # NegBin: Gamma-Poisson (its exact model) at retailer
+            opt = make_bayes_rung(h=H_COST, b=B_COST, prior_mean=mu)
+            opt_name = "Bayes"
+        oz = [bl_rollout(env, opt, HELDOUT_SEED_BASE + e)[0] for e in range(episodes)]
+        az = [bl_rollout(env, AdaptiveForecastPolicy(h=H_COST, b=B_COST),
+                         HELDOUT_SEED_BASE + e)[0] for e in range(episodes)]
+        dC, oC, aC = float(np.mean(d)), float(np.mean(oz)), float(np.mean(az))
+        vs = 100.0 * (oC - dC) / max(1e-6, oC)
+        out[name] = {"draco": dC, "optimal": oC, "optimal_kind": opt_name, "adaptive": aC, "vs_opt_pct": vs}
+        print(f"    {name:<16}{dC:>10.1f}{oC:>10.1f}{aC:>10.1f}{vs:>8.1f}%  {opt_name}")
+    print("    (*Optimal = AR1-opt (MMFE) for AR(1), Bayes (Gamma-Poisson) for NegBin. vs Opt>0 = DRACO")
+    print("     below the family's proper optimum; on AR(1) compare to AR1-opt, NOT Bayes.)")
+    return out
 
 
 # ==============================================================================
@@ -563,18 +674,61 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--cvar", type=float, default=0.2, help="tail level for CVaR cost")
-    ap.add_argument("--bar", type=float, default=4726.0, help="fixed-policy BAR (baselines.py regime)")
-    ap.add_argument("--ceiling", type=float, default=2202.0, help="per-lambda CEILING (baselines.py regime)")
+    ap.add_argument("--refs-json", default="results/baselines_regime_v2.json",
+                    help="four-rung refs from `python scripts/baselines.py regime` (single source of "
+                         "truth; derives BAR/CEILING/Bayes unless --bar/--ceiling override them)")
+    ap.add_argument("--bar", type=float, default=None, help="override fixed-policy BAR (else from --refs-json)")
+    ap.add_argument("--ceiling", type=float, default=None, help="override per-lambda CEILING (else from --refs-json)")
     ap.add_argument("--regime-episodes", type=int, default=20, help="episodes per held-out lambda")
+    ap.add_argument("--dump-c1", default=None, metavar="DIR",
+                    help="PRODUCER mode: write per-seed {lambda: cost} to DIR/seed{S}.json (the input to "
+                         "c1_stats), then exit. Run once per Phase-2 checkpoint.")
+    ap.add_argument("--dump-c1-episodes", type=int, default=200, help="episodes/lambda for --dump-c1")
+    ap.add_argument("--seed", type=int, default=None, help="seed label for --dump-c1 (default: checkpoint's seed)")
     ap.add_argument("--messages", action="store_true", help="run the Study-2 message analysis")
     ap.add_argument("--full", action="store_true",
                     help="generate EVERYTHING: per-stage OM dashboard, belief calibration+MI, "
                          "adaptation speed, message responsiveness, comm decomposition (all scenarios)")
     ap.add_argument("--diag-episodes", type=int, default=20, help="episodes for the belief diagnostics")
+    ap.add_argument("--families", action="store_true",
+                    help="held-out-FAMILY eval (M2.4): AR(1)/NegBin distributional-shift tests vs the "
+                         "family-aware Bayes/Adaptive rungs")
+    ap.add_argument("--family-episodes", type=int, default=50)
+    ap.add_argument("--family-mu", type=float, default=12.0, help="held mean demand for the family tests")
+    ap.add_argument("--ar1-rhos", nargs="+", type=float, default=[0.0, 0.3, 0.6, 0.9],
+                    help="AR(1) autocorrelations to test (the comm-value-vs-rho axis for Study 3)")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location=DEVICE, weights_only=False)
     cfg = ckpt.get("config", {}).get("agent", {})
+
+    # ---- PRODUCER mode: just dump per-seed per-lambda costs for c1_stats, then exit ----
+    if args.dump_c1:
+        dump_c1(ckpt, args.dump_c1_episodes, args.dump_c1, seed=args.seed)
+        return
+
+    # ---- resolve C1 references: explicit CLI > --refs-json > hardcoded fallback ----
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    refs_path = args.refs_json if os.path.isabs(args.refs_json) else os.path.join(_root, args.refs_json)
+    bar, ceiling, bayes = args.bar, args.ceiling, None
+    if os.path.exists(refs_path):
+        try:
+            from scripts.c1_stats import load_rungs, mean_refs
+            _m = mean_refs(load_rungs(refs_path), HELDOUT_LAMBDAS)
+            if bar is None:
+                bar = _m.get("BAR_static")
+            if ceiling is None:
+                ceiling = _m.get("Oracle")
+            bayes = _m.get("Bayes")
+            print(f"  C1 refs <- {os.path.basename(refs_path)}: "
+                  f"BAR={bar} Oracle={ceiling} Bayes={bayes}")
+        except Exception as e:
+            print(f"  (refs-json load failed: {type(e).__name__}: {e}; using CLI/defaults)")
+    if bar is None:
+        bar = 4726.0
+    if ceiling is None:
+        ceiling = 2202.0
+
     print(f"\nDRACO v4 eval  |  ckpt={os.path.basename(args.ckpt)}  |  head={cfg.get('actor_head')}  "
           f"|  encoder={cfg.get('encoder_type','gru')}  |  comm={cfg.get('use_comm')}"
           f"/{cfg.get('comm_topology','neighbor')}  |  episodes={args.episodes}\n")
@@ -626,7 +780,12 @@ def main():
         per_stage_dashboard(ckpt, args.episodes, scenario, eps=eps_by_scenario[scenario])
 
     # ---- regime-uncertainty (C1) ----
-    regime_uncertainty(ckpt, args.regime_episodes, args.bar, args.ceiling)
+    regime_uncertainty(ckpt, args.regime_episodes, bar, ceiling, bayes=bayes)
+
+    # ---- held-out-family eval (M2.4, distributional shift; AR(1)-rho axis for Study 3) ----
+    if args.families or args.full:
+        heldout_family_eval(ckpt, episodes=args.family_episodes, mu=args.family_mu,
+                            ar1_rhos=tuple(args.ar1_rhos))
 
     # ---- message analysis (Study 2) ----
     if args.messages or args.full:

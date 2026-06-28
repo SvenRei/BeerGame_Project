@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # repo root on path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root (parent of test/) on path
 
 from agents.draco_v4 import (
     ADJ, DemandRandomizedBeerGame, make_encoder, make_actor,

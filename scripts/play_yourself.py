@@ -316,9 +316,12 @@ class BeerGameGUI:
 
         ostr = ",".join(str(orders[a]) for a in self.agents)
         retailer = self.agents[0]
+        # realized retailer demand is nested under training_targets (the env keeps the obs clean);
+        # .get() chain so this never KeyErrors if the env's info schema changes.
+        realized_demand = infos[retailer].get("training_targets", {}).get("demand", 0.0)
         self.log_text.insert(tk.END,
             f"wk {self.env.current_step:2d} | ord {ostr:>16s} | cost {self.last_step_cost:8.2f} "
-            f"| demand({retailer})={infos[retailer]['demand']:.0f}\n")
+            f"| demand({retailer})={realized_demand:.0f}\n")
         self.log_text.see(tk.END)
         self._refresh()
 

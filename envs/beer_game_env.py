@@ -79,6 +79,10 @@ def _parse_lead_spec(cfg, fixed_key, range_key, default_fixed):
 
 
 class TransitPipeline:
+    """A delay line for goods or orders in transit. `pipeline` maps an ARRIVAL step -> quantity:
+    add_shipment(t, q, lead) schedules q to land at t+lead; receive_shipment(t) pops (and removes)
+    whatever arrives at step t. Used for both the order pipeline (an order travelling UP to the
+    supplier) and the shipment pipeline (goods travelling DOWN to the customer)."""
     def __init__(self):
         self.pipeline = {}
 
@@ -128,6 +132,16 @@ class BeerGameParallelEnv(ParallelEnv):
 
         if not _is_strict_num(self.h) or not _is_strict_num(self.b): raise ValueError("Costs must be numeric")
         if not np.isfinite(self.h) or not np.isfinite(self.b) or self.h < 0 or self.b < 0: raise ValueError("Costs must be finite positive")
+
+        # CANONICAL-COST FLAG (default off -> behavior unchanged; old checkpoints/runs stay valid).
+        # When True, the backorder penalty is charged ONLY at the retailer (customer-facing) stage:
+        # the canonical Clark-Scarf (1960) serial cost, for which an echelon base-stock policy is
+        # PROVABLY optimal and the cost is provably convex. Default False = the beer-game team cost
+        # (service at every echelon: each stage pays for its own backlog). Holding cost is charged
+        # at every stage in BOTH modes (standard for the serial model).
+        self._penalty_at_retailer_only = self._config.get("penalty_at_retailer_only", False)
+        if type(self._penalty_at_retailer_only) is not bool:
+            raise ValueError("penalty_at_retailer_only must be a strict boolean")
 
         # --- LEAD-TIME CONFIGURATION --------------------------------------------
         # REVISION 6: behavior is unchanged here; the corrected test suite adds
@@ -299,6 +313,17 @@ class BeerGameParallelEnv(ParallelEnv):
                 raise ValueError(f"Action for {agent} must be finite")
 
     def step(self, actions):
+        """Advance one period (week). The four phases below execute in this fixed order each step:
+          PHASE 1  RECEIVE  -- goods scheduled to arrive now land in inventory.
+          PHASE 2  FULFIL   -- each stage sees its incoming demand (retailer: customer demand;
+                               others: the downstream stage's arriving orders), ships what it can
+                               (rest -> backlog) DOWN the chain; the manufacturer turns received
+                               orders into production (-> its own shipment pipe after production lead).
+          PHASE 3  ORDER    -- each agent's action S becomes order = clip(S-IP); it travels UP to the
+                               supplier after the order (information) lead.
+          PHASE 4  COST     -- charge h*inventory (+ b*backlog, every stage by default / retailer only
+                               if penalty_at_retailer_only); reward = -total_system_cost (shared).
+        Returns the PettingZoo parallel tuple (obs, rewards, terminations, truncations, infos)."""
         if not self.agents:
             raise RuntimeError("Environment stepped after done")
 
@@ -374,7 +399,12 @@ class BeerGameParallelEnv(ParallelEnv):
         # signal. Existing keys are kept for backwards compatibility.
         local_costs = {}
         for agent in self.agents:
-            cost = (self.h * self.inventory[agent]) + (self.b * self.backlog[agent])
+            # canonical (Clark-Scarf) cost charges the backorder penalty at the retailer only;
+            # the default beer-game cost charges it at every echelon. Holding cost: every echelon.
+            backorder_term = self.b * self.backlog[agent]
+            if self._penalty_at_retailer_only and agent != "retailer":
+                backorder_term = 0.0
+            cost = (self.h * self.inventory[agent]) + backorder_term
             local_costs[agent] = cost
             total_system_cost += cost
 

@@ -37,6 +37,10 @@ from agents.draco_v4 import (
 from agents.heldout_eval import make_heldout_envs, run_heldout_eval, HELDOUT_LAMBDAS  # held-out-lambda eval (C1 gate)
 from agents.topologies import get_adj                                 # Study-2 comm topology selector
 from envs.beer_game_env import BeerGameParallelEnv
+try:
+    from scripts.c1_stats import load_rungs, mean_refs                # single source of truth for BAR/Oracle/Bayes refs
+except Exception:
+    load_rungs = mean_refs = None
 
 
 def set_global_seeds(seed):
@@ -45,6 +49,23 @@ def set_global_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+# ==============================================================================
+# READING GUIDE -- what this training script does, top to bottom:
+#   1. Build the DR curriculum env (DemandRandomizedBeerGame: random Poisson rate
+#      per episode, or FamilyRandomizedBeerGame if agent.dr_mode=family).
+#   2. Load the BAR/Oracle/Bayes reference costs from baselines_regime_v2.json
+#      (single source of truth) so the held-out metric is comparable to the paper.
+#   3. Build the modules (encoder, 4 actor heads, 4 message heads, critic) and the
+#      DRACOTrainerV4 that owns the three optimizers.
+#   4. run_episode(): roll ONE episode. It re-encodes the belief each step, picks a
+#      base-stock S per agent (the PPO action), converts S -> order -> [0,1] action,
+#      routes messages with a one-step delay, and stores everything for training.
+#   5. Main loop: warm up -> collect batch_episodes rollouts -> trainer.update() ->
+#      periodically run the held-out-lambda eval (the C1 gate) and CHECKPOINT/early-
+#      stop on that held-out cost (NOT the noisy training cost).
+# Config comes from Hydra (conf/config.yaml + conf/agent/draco_v4.yaml); override
+# anything on the CLI, e.g.  agent.use_comm=true agent.actor_head=mlp seed=10.
+# ==============================================================================
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
     base_seed = cfg.get("seed", 1000)
@@ -60,13 +81,32 @@ def main(cfg: DictConfig):
     _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     env_cfg = OmegaConf.to_container(cfg.env, resolve=True)
+    # DR curriculum: 'poisson' (default) randomizes only the Poisson RATE; 'family' randomizes the
+    # demand FAMILY per episode (Poisson + NegBin overdispersion + AR(1) autocorrelation) -> trains
+    # distributional robustness (M2). Hold one family out (dr_families) for the held-out-family test.
+    dr_mode = cfg.agent.get("dr_mode", "poisson")
     _dr_kw = dict(
         lam_lo=cfg.agent.get("dr_lambda_lo", 4.0),
         lam_hi=cfg.agent.get("dr_lambda_hi", 16.0),
         p_shift=cfg.agent.get("dr_p_shift", 0.5),
         shift_scale=cfg.agent.get("dr_shift_scale", 2.0),
     )
-    env = DemandRandomizedBeerGame(env_cfg, **_dr_kw)
+    if dr_mode == "family":
+        from scripts.demand_families import make_demand_family_envs
+        _, _, FamilyRandomizedBeerGame = make_demand_family_envs(BeerGameParallelEnv)
+        fam_cfg = dict(env_cfg)
+        if cfg.agent.get("dr_families") is not None:
+            fam_cfg["dr_families"] = list(cfg.agent.get("dr_families"))
+        for _k in ("dr_lambda_lo", "dr_lambda_hi", "nb_mu_lo", "nb_mu_hi", "nb_dispersion_lo",
+                   "nb_dispersion_hi", "ar1_mu_lo", "ar1_mu_hi", "ar1_rho_lo", "ar1_rho_hi", "ar1_sigma"):
+            _v = cfg.agent.get(_k)
+            if _v is not None:
+                fam_cfg[_k] = float(_v)
+        env = FamilyRandomizedBeerGame(fam_cfg)
+        print(f"[draco-v4] DR mode=FAMILY, training families="
+              f"{fam_cfg.get('dr_families', ['poisson', 'negbin', 'ar1'])}", flush=True)
+    else:
+        env = DemandRandomizedBeerGame(env_cfg, **_dr_kw)
     obs, _ = env.reset(seed=base_seed)
 
     eval_env_poisson = BeerGameParallelEnv({**env_cfg, "demand_type": "poisson"})
@@ -83,8 +123,31 @@ def main(cfg: DictConfig):
     heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg, heldout_lams)
     heldout_every  = cfg.agent.get("heldout_every", 200)
     heldout_eps    = cfg.agent.get("heldout_episodes", 20)
-    heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4268.0)   # BAR     from `baselines.py regime`
-    heldout_oracle = cfg.agent.get("heldout_oracle_ref", 1987.0)  # CEILING from `baselines.py regime`
+    # References (BAR / Oracle / Bayes) come from the FOUR-rung ladder written by
+    # `python scripts/baselines.py regime` -> results/baselines_regime_v2.json. That JSON is the
+    # SINGLE SOURCE OF TRUTH shared by baselines.py, this trainer, and eval_draco_v4.py. The YAML
+    # scalars below are a FALLBACK only: used when the JSON is absent, or for a validation-lambda
+    # run that the test-lambda JSON does not cover (mean_refs returns {} -> .get keeps the YAML
+    # value, and Phase-1 selection is on Mean_Cost so the ref is irrelevant there anyway).
+    # Hydra changes the CWD to the run dir, so resolve the path against the repo root (_ROOT).
+    heldout_fixed  = cfg.agent.get("heldout_fixed_ref", 4726.0)   # BAR     fallback
+    heldout_oracle = cfg.agent.get("heldout_oracle_ref", 2202.0)  # CEILING fallback
+    heldout_bayes  = None                                          # analytic Bayes-adaptive rung (the real bar)
+    _refs_path = cfg.agent.get("refs_json", "results/baselines_regime_v2.json")
+    if not os.path.isabs(_refs_path):
+        _refs_path = os.path.join(_ROOT, _refs_path)
+    if load_rungs is not None and os.path.exists(_refs_path):
+        _m = mean_refs(load_rungs(_refs_path), heldout_lams)
+        heldout_fixed  = _m.get("BAR_static", heldout_fixed)
+        heldout_oracle = _m.get("Oracle", heldout_oracle)
+        heldout_bayes  = _m.get("Bayes")
+        print(f"[draco-v4] refs <- {os.path.basename(_refs_path)} on lambdas {heldout_lams}: "
+              f"BAR={heldout_fixed:.1f} Oracle={heldout_oracle:.1f} "
+              f"Bayes={'n/a' if heldout_bayes is None else f'{heldout_bayes:.1f}'}", flush=True)
+    else:
+        print(f"[draco-v4] refs JSON not found at {_refs_path}; using YAML fallback "
+              f"BAR={heldout_fixed:.1f} Oracle={heldout_oracle:.1f} "
+              f"(run `python scripts/baselines.py regime` to generate it).", flush=True)
 
     run_dir = os.path.join(_ROOT, "weights_draco", f"run_dracov4_{run.id}")
     os.makedirs(run_dir, exist_ok=True)
@@ -168,12 +231,16 @@ def main(cfg: DictConfig):
             if not use_comm:
                 incoming = torch.zeros_like(incoming)
 
-            # belief via prefix re-encode (uniform across GRU/CRAFT; action-free, causal)
+            # BELIEF via prefix re-encode: append this step's (obs, incoming msg) to the
+            # running history, then re-run the causal encoder over the WHOLE history so far
+            # and take the last position as the current belief z_t. (Re-encoding the prefix
+            # each step keeps GRU and transformer identical and guarantees causality -- the
+            # belief at t depends only on steps <= t, never on the future.)
             obs_hist.append(o_t); msg_hist.append(incoming)
             obs_seq = torch.stack(obs_hist[-craft_max_len:])                      # [t,N,od]
             msg_seq = torch.stack(msg_hist[-craft_max_len:])                      # [t,N,msg]
             mu, ls, _ = encoder.forward_sequence(obs_seq, msg_seq)
-            z_t = mu[-1]                                                          # [N,z] posterior mean
+            z_t = mu[-1]                                                          # [N,z] posterior mean (current belief)
             if belief_sample:
                 z_t = z_t + torch.randn_like(z_t) * ls[-1].exp()                 # BAMDP: act on a sample
             z_act = z_t if use_context else torch.zeros_like(z_t)
@@ -204,6 +271,10 @@ def main(cfg: DictConfig):
                     for i in range(N):
                         m_out[i] = msg_heads[i](o_t[i:i + 1], z_t[i:i + 1]).squeeze(0)
 
+            # Convert the chosen order-up-to level S into the env's action: order =
+            # clip(S - IP), then rescale to the [0,1] fraction the env expects (it maps the
+            # fraction back to round(frac*max_order) units). So the PPO action is S, but what
+            # the env actually executes is the resulting replenishment order.
             order, IP = BaseStockActor.order_from_S(S, o_t, max_order)            # [N,1]
             frac = (order / max_order).clamp(0.0, 1.0)
             acts = {a: [float(frac[i, 0].item())] for i, a in enumerate(cur)}
@@ -247,6 +318,9 @@ def main(cfg: DictConfig):
     episode_buffers = []
     a_loss = c_loss = e_loss = 0.0
     for ep in range(cfg.total_episodes):
+        # On-policy loop: play an episode (stochastic actions so PPO can explore), buffer it,
+        # and once batch_episodes have accumulated, do ONE trainer.update() on that batch and
+        # clear it. warm_up lets the belief encoder settle before the policy starts learning.
         train_this = ep >= warm_up
         buf, ep_cost, ep_costs, msgs_log, (s_mean, order_mean) = run_episode(
             ep, target_env=env, collect=train_this, deterministic=False)
@@ -301,6 +375,12 @@ def main(cfg: DictConfig):
         if ep > warm_up and ep % heldout_every == 0:
             hl = run_heldout_eval(run_episode, heldout_envs, base_seed, heldout_eps,
                                   fixed_ref=heldout_fixed, oracle_ref=heldout_oracle)
+            if heldout_bayes is not None:
+                _mc = hl["Eval_lambda/Mean_Cost"]
+                hl["Eval_lambda/Bayes_ref"] = heldout_bayes
+                # the headline comparison: DRACO vs the analytic Bayes-adaptive policy
+                hl["Eval_lambda/vs_Bayes_Pct"] = 100.0 * (heldout_bayes - _mc) / max(1e-6, heldout_bayes)
+                hl["Eval_lambda/Bayes_Gap_Recovered"] = (heldout_bayes - _mc) / max(1e-6, heldout_bayes - heldout_oracle)
             log.update(hl)
             hcost = hl["Eval_lambda/Mean_Cost"]
             if hcost < best:

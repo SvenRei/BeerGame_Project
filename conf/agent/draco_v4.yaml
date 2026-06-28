@@ -87,6 +87,26 @@ dr_lambda_hi: 24.0
 dr_p_shift: 0.0
 dr_shift_scale: 2.5
 
+# ===================== distributional-robustness DR (M2; OFF by default) =====================
+# dr_mode=poisson (default) randomizes only the Poisson RATE (rate-robustness within one family).
+# dr_mode=family randomizes the demand FAMILY per episode -> Poisson rate + NegBin overdispersion
+# + AR(1) autocorrelation (distributional robustness). Train on a SUBSET (dr_families) and hold a
+# family OUT for the held-out-family test: `python agents/eval_draco_v4.py --ckpt ... --families`.
+# Sources: NegBin retail demand = Agrawal & Smith (1996); AR(1) demand/bullwhip = Lee et al. (1997),
+# Lee, So & Tang (2000); Poisson = classical (Hadley & Whitin 1963). No env edit -- demand_families.py
+# subclasses the env (demand_type stays 'poisson', a 'family' key routes the sampler).
+dr_mode: poisson
+dr_families: [poisson, negbin]   # training families; ar1 held out for the distributional-shift test
+nb_mu_lo: 4.0
+nb_mu_hi: 24.0
+nb_dispersion_lo: 2.0            # NegBin dispersion r: var = mu + mu^2/r  (smaller r = burstier demand)
+nb_dispersion_hi: 12.0
+ar1_mu_lo: 4.0
+ar1_mu_hi: 24.0
+ar1_rho_lo: 0.0
+ar1_rho_hi: 0.8                  # AR(1) lag-1 autocorrelation (the Lee-et-al info-sharing regime)
+ar1_sigma: 3.0
+
 # ===================== in-training evaluation =====================
 eval_every: 50
 eval_episodes: 5

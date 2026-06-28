@@ -25,6 +25,9 @@ ADJ_TOPOLOGIES = {
                  [0.5, 0.0, 0.5, 0.0],
                  [0.0, 0.5, 0.0, 0.5],
                  [0.0, 0.0, 1.0, 0.0]],
+    # no_neighbor: a CONTROL/placebo -- each agent hears only NON-adjacent agents (the "wrong"
+    # partners). If comm helps via the serial demand-signal channel (Lee see-through-bullwhip),
+    # this should NOT help; a gain here would mean the benefit is not that mechanism.
    "no_neighbor":[[0.0, 0.0, 0.5, 0.5],
                  [0.0, 0.0, 0.0, 1.0],
                  [1.0, 0.0, 0.0, 0.0],

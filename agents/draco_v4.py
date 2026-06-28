@@ -56,6 +56,46 @@ from torch.distributions import Normal
 from envs.beer_game_env import BeerGameParallelEnv
 
 
+# ==============================================================================
+# READING GUIDE (for learning the beer game with DRACO)
+# ------------------------------------------------------------------------------
+# DRACO is a cooperative multi-agent actor-critic (MAPPO) for the 4-echelon beer
+# game, with three ideas layered on top of plain PPO. Read the modules in this
+# order; the numbers match the section banners below.
+#
+#   1. BELIEF over the demand regime  (Module B = the encoders).
+#      Each agent sees only 4 local scalars, so it cannot directly observe the
+#      demand RATE. A causal, action-free encoder (GRU or CRAFT transformer) reads
+#      the observation HISTORY and outputs a latent z, trained by a self-supervised
+#      ELBO to RECONSTRUCT the demand it just saw. So z encodes "which regime am I
+#      in" -- this is the BAMDP / meta-RL idea (VariBAD, PEARL).
+#
+#   2. BASE-STOCK actor head  (Module A).
+#      The actor does NOT emit a raw order. It emits an order-up-to level S, and the
+#      env order = clip(S - IP). The "structured" head bakes in the textbook rule
+#      S = lead*d_hat + safety + small_correction, where d_hat is read from the
+#      belief z -- so S tracks the demand level and EXTRAPOLATES when the regime
+#      shifts. The "mlp" head is the unconstrained control (the substrate that
+#      scripts/distill_symbolic.py distills back into a base-stock equation).
+#
+#   3. OPTIONAL COMMUNICATION  (Module C = the message head).
+#      Agents may broadcast a message -- a learned DIAL vector, or just their
+#      detached demand belief d_hat -- routed along a topology (ADJ) with a one-step
+#      delay. Study 3 asks whether this helps (Axsater-Rosling predicts ~0 in a
+#      stationary serial chain; Lee et al. predict >0 under autocorrelated demand).
+#
+#   TRAINING is CTDE (centralized training, decentralized execution): a centralized
+#   critic (Module D) sees the global pipeline state during training only; at
+#   deployment each agent acts on its local 4-scalar view alone.
+#
+#   THE LEARNING STEP is DRACOTrainerV4.update() -- read it LAST. It ties together
+#   three independent optimizers: (i) the encoder ELBO, (ii) the critic regression
+#   to the lambda-return, and (iii) the PPO actor surrogate. The belief z is
+#   DETACHED everywhere except its own ELBO, so the encoder is a clean demand
+#   forecaster and the policy/critic just read it.
+# ==============================================================================
+
+
 # Chain adjacency = neighbour-only comm matrix, ROW-NORMALISED (receiver gets the
 # MEAN of its neighbours' messages). DIAL routing is incoming = ADJ @ messages.
 #   retailer(0) <-> wholesaler(1) <-> distributor(2) <-> manufacturer(3)
@@ -247,6 +287,11 @@ class BaseStockActor(nn.Module):
 
     @staticmethod
     def order_from_S(S, obs, max_order):
+        # THE base-stock rule, shared by both heads. The policy chooses a target stock
+        # level S (the "order-up-to" level); the actual order is whatever is needed to
+        # lift the inventory POSITION up to S, clipped to [0, max_order]. Inventory
+        # position IP = on-hand - backlog + on-order is the standard quantity a
+        # base-stock policy controls (it nets out goods already in the pipeline).
         IP = obs[..., 0:1] - obs[..., 1:2] + obs[..., 2:3]        # inv - backlog + on_order
         order = torch.clamp(S - IP, min=0.0, max=max_order)
         return order, IP
@@ -513,8 +558,13 @@ class DRACOTrainerV4:
 
     # ---- finite-horizon GAE with 0-bootstrap at truncation (critic is time-aware) ----
     def _gae(self, rew, val, done):
+        # Generalized Advantage Estimation (Schulman et al. 2016). The advantage A_t
+        # tells the actor how much better than expected action t turned out. We sweep
+        # BACKWARD in time accumulating the TD error delta_t = r_t + gamma*V_{t+1} - V_t,
+        # exponentially smoothed by gae_lambda (bias/variance knob). nonterm zeros the
+        # bootstrap at the episode boundary (finite horizon -> no value after the last step).
         T = rew.size(0)
-        ve = torch.cat([val, torch.zeros(1, device=self.device)], dim=0)
+        ve = torch.cat([val, torch.zeros(1, device=self.device)], dim=0)   # V with a 0 tail
         adv = torch.zeros(T, device=self.device)
         last = torch.zeros((), device=self.device)
         for t in reversed(range(T)):
@@ -535,10 +585,15 @@ class DRACOTrainerV4:
                 dtgt=torch.stack(b.demand_tgt),
             ))
 
-        # SRDQN per-agent shaped reward in RAW units ([CORR-B]: normalization handles scale).
+        # CREDIT ASSIGNMENT (SRDQN-style). The true objective is the TEAM cost, but giving
+        # every agent the full team cost is a noisy signal. Each agent's shaped reward is
+        # -(own cost + beta * everyone-else's cost): mostly its own cost, partially the
+        # team's, so it still cares about global performance. beta in [0,1] interpolates
+        # selfish (0) <-> fully cooperative (1). Rewards stay in RAW $ units; the value
+        # normalizer (RunningNorm) handles the scale, so no reward_scale knob is needed.
         for d in E:
-            c = d["cost"]
-            others = c.sum(dim=-1, keepdim=True) - c
+            c = d["cost"]                                      # [T, N] per-agent local cost
+            others = c.sum(dim=-1, keepdim=True) - c           # sum of the OTHER agents' costs
             d["rew"] = -(c + self.srdqn_beta * others)
 
         # belief + advantages (baseline = ONLINE critic, de-normalized) [CORR-C: no target net]
@@ -552,16 +607,23 @@ class DRACOTrainerV4:
                 d["V"], d["adv"] = V, adv
                 # [FIX 2 kept] critic regression target = GAE lambda-return = V + adv (real scale)
                 d["vtarget"] = (V + adv).detach()
+            # Standardize advantages across the whole batch (per agent) -> zero mean, unit
+            # std. This is standard PPO practice: it stabilizes the gradient scale and is
+            # why a reward_scale knob is unnecessary (it would cancel out here).
             all_adv = torch.cat([d["adv"] for d in E], dim=0)
             a_mean, a_std = all_adv.mean(dim=0), all_adv.std(dim=0) + 1e-8
             for d in E:
                 d["adv"] = (d["adv"] - a_mean) / a_std
             # [CORR-B] refresh the value-target normalizer from the real-scale returns
             self.ret_norm.update(torch.cat([d["vtarget"].reshape(-1) for d in E]))
+            # OPTIONAL risk sensitivity (off by default, risk_eta=0). CVaR = "conditional
+            # value at risk" = focus on the worst tail. We find the worst cvar_alpha fraction
+            # of episodes (highest team cost) and UP-WEIGHT their advantages, so the policy
+            # pays extra attention to bad outcomes (Tamar-style). Uses EMPIRICAL returns, not
+            # the critic, which is why the critic can stay a plain mean predictor.
             if self.risk_eta > 0:
-                # trajectory-level CVaR reweight (Tamar-style), EMPIRICAL returns -- not the critic
-                team_ret = torch.stack([-(d["cost"].sum()) for d in E])
-                k = max(1, int(math.ceil(self.cvar_alpha * len(E))))
+                team_ret = torch.stack([-(d["cost"].sum()) for d in E])      # per-episode team return
+                k = max(1, int(math.ceil(self.cvar_alpha * len(E))))         # size of the worst tail
                 thresh = torch.topk(team_ret, k, largest=False).values.max()
                 for j, d in enumerate(E):
                     if (team_ret[j] <= thresh).item():
@@ -584,6 +646,14 @@ class DRACOTrainerV4:
             c_loss_tot += closs
 
         # ---- ENCODER: demand-reconstruction ELBO. [FIX 3 kept] reconstruct RAW demand ----
+        # This is what makes z a "belief about the regime". It is a variational autoencoder
+        # objective on the demand signal, trained SEPARATELY from the policy (the encoder has
+        # its own optimizer; the policy/critic read z detached). Two terms:
+        #   pred_loss : reconstruct the demand the agent actually saw (dtgt) from the belief
+        #               -> forces z to carry demand-rate information. Target is RAW demand
+        #               (FIX 3: no /100), so d_hat lands on the right scale for the base-stock head.
+        #   kl        : pull the latent toward a unit Gaussian prior (the "variational" regularizer)
+        #               -> keeps z smooth/compact; kl_coef is the information-bottleneck weight.
         for _ in range(self.k_epochs):
             self.enc_opt.zero_grad()
             eloss = 0.0
@@ -610,6 +680,10 @@ class DRACOTrainerV4:
                         m = torch.stack([self.actors[i].demand_estimate(z[:, i]).detach() / 100.0 for i in range(N)], dim=1)
                     else:
                         m = torch.stack([self.msg_heads[i](d["obs"][:, i], z[:, i]) for i in range(N)], dim=1)
+                    # route messages along the topology: incoming[i] = sum_j ADJ[i,j] * msg[j]
+                    # (the einsum does this for every timestep t at once), then shift by ONE step
+                    # so an agent reads what its neighbours sent LAST period (messages travel with a
+                    # one-step delay, like orders). Row 0 gets zeros (nothing received at t=0).
                     routed = torch.einsum("ij,tjm->tim", self.adj, m)
                     incoming = torch.cat([torch.zeros(1, N, m.size(-1), device=dev), routed[:-1]], dim=0)
                 else:
@@ -617,14 +691,19 @@ class DRACOTrainerV4:
                     incoming = torch.zeros(T, N, d["msg_in"].size(-1), device=dev)
                 loss = torch.zeros((), device=dev)
                 for i in range(N):
+                    # PPO clipped surrogate, per agent. Re-evaluate the policy at the stored
+                    # states to get the new log-prob of the action S it actually took; ratio =
+                    # new/old probability. We push ratio in the direction of the advantage A,
+                    # but CLIP it to [1-eps, 1+eps] so a single update can't move the policy too
+                    # far (the core PPO trust-region trick). entropy term encourages exploration.
                     s_mu, s_std = self.actors[i](d["obs"][:, i], z_act[:, i], incoming[:, i])
                     logp = Normal(s_mu, s_std).log_prob(d["S_act"][:, i]).sum(-1, keepdim=True)
-                    ratio = torch.exp(logp - d["old_logp"][:, i])
+                    ratio = torch.exp(logp - d["old_logp"][:, i])          # pi_new / pi_old
                     A = d["adv"][:, i].unsqueeze(-1)
                     surr1 = ratio * A
                     surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * A
                     ent = Normal(s_mu, s_std).entropy().mean()
-                    loss = loss - torch.min(surr1, surr2).mean() - self.entropy_coef * ent
+                    loss = loss - torch.min(surr1, surr2).mean() - self.entropy_coef * ent   # maximize -> minimize negative
                     if self.s_smooth_coef > 0 and s_mu.size(0) > 1:
                         loss = loss + self.s_smooth_coef * (s_mu[1:] - s_mu[:-1]).abs().mean()
                     if self.demand_aux_coef > 0 and hasattr(self.actors[i], "demand_estimate"):

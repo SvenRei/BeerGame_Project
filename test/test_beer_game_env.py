@@ -1,6 +1,11 @@
+import os
+import sys
 import unittest
 import numpy as np
 
+# Put the repo root (parent of test/) on the path so `envs`/`agents` resolve no matter where
+# this is launched from -- e.g. `python test/test_beer_game_env.py` or `python -m pytest test/`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.beer_game_env import BeerGameParallelEnv
 
 AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
