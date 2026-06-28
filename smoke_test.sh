@@ -37,6 +37,8 @@ run "env unit tests (test_beer_game_env, 89 tests)" "$PY" test/test_beer_game_en
 run "c1_stats self-test"             "$PY" scripts/c1_stats.py
 run "demand_families self-test"      "$PY" scripts/demand_families.py
 run "distill_symbolic self-test"     "$PY" scripts/distill_symbolic.py
+run "dp_optimum self-test"           "$PY" scripts/dp_optimum.py
+run "confirmatory_report self-test"  "$PY" scripts/run_confirmatory_report.py
 run "env smoke (default + canonical cost)" "$PY" -c "
 from envs.beer_game_env import BeerGameParallelEnv
 for flag in (False, True):
@@ -70,7 +72,7 @@ if have torch && have wandb && have hydra; then
   CKPT="$(ls -t weights_draco/*/draco_checkpoint_best.pt 2>/dev/null | head -1)"
   if [ -n "$CKPT" ]; then
     echo "   (using checkpoint: $CKPT)"
-    run "eval: standard + regime(C1) + families + bullwhip"  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --episodes 3 --regime-episodes 2 --families --family-episodes 2 --ar1-rhos 0.0 0.6 --bullwhip --bullwhip-episodes 2
+    run "eval: standard + regime(C1) + families + bullwhip + action-diag"  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --episodes 3 --regime-episodes 2 --families --family-episodes 2 --ar1-rhos 0.0 0.6 --bullwhip --bullwhip-episodes 2 --action-diag
     run "eval: dump-c1 producer"                  "$PY" agents/eval_draco_v4.py --ckpt "$CKPT" --dump-c1 results/smoke_c1 --dump-c1-episodes 2 --seed 0
     run "c1_stats report (needs refs json)"       bash -c "[ -f results/baselines_regime_v2.json ] && \"$PY\" scripts/c1_stats.py report --draco-dir results/smoke_c1 || echo '(skip: run baselines.py regime first)'"
     run "distill on real ckpt (linear, 1 DAgger round)" "$PY" scripts/distill_symbolic.py --ckpt "$CKPT" --backend linear --dagger-rounds 1 --bc-episodes 3 --dagger-episodes 2 --eval-episodes 3 --fidelity-episodes 2

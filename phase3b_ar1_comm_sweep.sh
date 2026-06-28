@@ -17,7 +17,7 @@
 # alternative is to train ONCE on rho ~ U[0,0.9] and evaluate per-rho with eval --ar1-rhos; do that if
 # compute is tight (1 pair of checkpoints instead of 4).
 #
-# Usage (same seeds as Phase 2 for CRN pairing):  ./phase3b_ar1_comm_sweep.sh 10 11 12 13 14
+# Usage (same >=10 seeds as Phase 2 for CRN pairing):  ./phase3b_ar1_comm_sweep.sh 10 11 12 13 14 15 16 17 18 19
 set -euo pipefail
 set -f   # keep Hydra list overrides like [ar1] / [6,10,14,18,22] intact through bash
 source "${VENV:-/workspace/venv}/bin/activate" 2>/dev/null || true
@@ -25,9 +25,11 @@ source "${VENV:-/workspace/venv}/bin/activate" 2>/dev/null || true
 cd "${REPO:-/workspace/BeerGame_Project}"
 
 LOCKED="agent.demand_aux_coef=0.3 agent.z_dim=8 agent.encoder_type=gru"   # the Phase-1 winner
-# Train ON AR(1); the held-out-lambda (Poisson) gate is only a checkpoint-selection PROXY here --
-# the comm VALUE is measured POST-HOC on the matched AR(1) rho (see ANALYSIS at the bottom).
+# Train ON AR(1) and gate (checkpoint/early-stop) on held-out AR(1) at VALIDATION rho {0.15,0.45,0.75}
+# (disjoint from the test rho below) so the selection target matches the AR(1) study objective.
+# The comm VALUE is measured POST-HOC on the matched test rho (see ANALYSIS at the bottom).
 BASE="agent=draco_v4 agent.actor_head=structured agent.use_context=true \
+      agent.heldout_mode=ar1 agent.heldout_ar1_rhos=[0.15,0.45,0.75] \
       agent.heldout_every=400 agent.heldout_episodes=20 \
       total_episodes=15000 agent.batch_episodes=8 agent.patience=3000 $LOCKED"
 DHAT="agent.msg_mode=dhat agent.msg_dim=1"

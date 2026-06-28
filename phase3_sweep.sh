@@ -16,7 +16,7 @@
 #   -> confirm it runs, no NaN, and (eval --messages) shows msg<->demand corr ~1.0 (msg IS d_hat).
 #
 # Usage (SAME seeds as Phase 2 so comm is CRN-paired against the nocomm refs):
-#   ./run_phase3_c2.sh 10 11 12 13 14
+#   ./run_phase3_c2.sh 10 11 12 13 14 15 16 17 18 19   (>=10 seeds; 5 = pilot only)
 set -euo pipefail
 set -f   # disable globbing so Hydra list overrides like [8,12,16,20] survive bash
 source /workspace/venv/bin/activate 2>/dev/null || true   # use the venv from setup_pod.sh

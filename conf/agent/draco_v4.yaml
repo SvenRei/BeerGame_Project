@@ -61,13 +61,14 @@ cvar_alpha: 0.2
 
 # ===================== SRDQN per-agent reward shaping =====================
 # Each agent's shaped reward is -(own_cost + srdqn_beta * others_cost). This is a CREDIT-ASSIGNMENT
-# choice, and it interacts with the reported objective:
-#   beta = 1.0  -> reward = -(total team cost) for every agent = EXACTLY the evaluation objective
-#                  (team-optimal; the objective-exact setting -- report this in the ablation).
-#   beta < 1.0  -> down-weights others' cost: lower-variance learning signal, but it does NOT
-#                  optimize the reported team cost. 0.5 is the default heuristic.
-# Run the beta ablation (phase_beta_sweep.sh) over {0.0, 0.5, 1.0} and report the sensitivity.
-srdqn_beta: 0.5
+# choice that interacts with the reported objective:
+#   beta = 1.0  -> reward = -(total team cost) for every agent = EXACTLY the evaluated objective.
+#                  This is the HEADLINE / objective-exact default.
+#   beta < 1.0  -> down-weights others' cost: lower-variance signal, but does NOT optimize the
+#                  reported team cost. Treat 0.0 / 0.5 as learning-stability ABLATIONS only.
+# phase_beta_sweep.sh sweeps {0.0, 0.5, 1.0}. If 0.5 yields lower team cost, report 1.0 as the
+# headline (objective-exact) and 0.5 as a justified shaped variant -- do not bury it.
+srdqn_beta: 1.0
 reward_scale: 50.0        # [v4-INERT] v4 uses running value-normalization instead of a fixed
                           # reward_scale; kept for back-compat only -- not read by the trainer.
 
@@ -92,7 +93,16 @@ patience: 3000
 lr_scheduler_step: 2000
 lr_scheduler_gamma: 0.5
 trace_every: 0
-heldout_lambdas: [6, 10, 14, 18, 22]   # held-out eval regimes; Phase 1/2 override to the VAL set on the CLI
+# LEAKAGE-SAFE DEFAULT: the in-training gate (checkpoint/early-stop) keys off these lambdas, so the
+# default is the VALIDATION split {8,12,16,20}. The C1 TEST lambdas {6,10,14,18,22} are computed
+# POST-HOC by eval_draco_v4.py (never used for selection). Override to test lambdas only with
+# agent.allow_test_gate=true (the trainer warns otherwise).
+heldout_lambdas: [8, 12, 16, 20]
+allow_test_gate: false                 # set true ONLY for a deliberate test-set gate (acknowledged leakage)
+# heldout_mode: poisson (default) | ar1 -> for the AR(1) comm study (Phase 3b), gate on held-out AR(1)
+# regimes at VALIDATION rho (disjoint from the test rho {0,.3,.6,.9}) so selection matches the objective.
+heldout_mode: poisson
+heldout_ar1_rhos: [0.15, 0.45, 0.75]
 
 # ===================== demand-randomisation curriculum = p(T) =====================
 # C1-validated: covers the held-out lambdas {6,10,14,18,22} so the held-out eval tests

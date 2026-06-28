@@ -8,7 +8,7 @@
 # This sweep reports how sensitive the C1 result is to beta in {0.0, 0.5, 1.0}, and lets you state
 # that the headline either uses the objective-exact beta=1.0 or that performance is beta-insensitive.
 #
-# Usage (same report seeds as Phase 2, for CRN pairing):  ./phase_beta_sweep.sh 10 11 12 13 14
+# Usage (same >=10 report seeds as Phase 2, for CRN pairing):  ./phase_beta_sweep.sh 10 11 12 13 14 15 16 17 18 19
 set -euo pipefail
 set -f   # keep Hydra list overrides like [8,12,16,20] intact through bash
 source "${VENV:-/workspace/venv}/bin/activate" 2>/dev/null || true

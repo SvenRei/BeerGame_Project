@@ -6,8 +6,9 @@
 #   2. FRESH seeds {10,11,12,13,14}, disjoint from the Phase-1 selection seeds {0,1,2}.
 # This makes Phase 2 an honest held-out estimate, not a re-report of the tuning objective.
 #
-# Usage (5 fresh report seeds; split across pods if you like):
-#   ./run_phase2_c1.sh 10 11 12 13 14
+# Usage (>=10 fresh report seeds; 5 is a PILOT only -- nonparametric p floored ~0.06 at n=5).
+# Split across pods if you like:
+#   ./run_phase2_c1.sh 10 11 12 13 14 15 16 17 18 19
 set -euo pipefail
 set -f   # disable globbing so Hydra list overrides like [8,12,16,20] survive bash
 source /workspace/venv/bin/activate 2>/dev/null || true   # use the venv from setup_pod.sh

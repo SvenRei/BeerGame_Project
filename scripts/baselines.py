@@ -584,19 +584,22 @@ def optimize_canonical_serial(lam, L=4, h=0.5, b=1.0, n_eps=300, seed=0, n_start
 
 def validate_canonical(lambdas=None, L=4, select_episodes=60, eval_episodes=120, env_cfg=None,
                        env_class=None, lo=0, hi=160, step=8, per_echelon=True, verbose=True):
-    """M3.4/M3.5 validation -- turn the env oracle into a VERIFIED ceiling.
+    """M3.4/M3.5 validation -- turn the env oracle into a VALIDATED COMPUTATIONAL CEILING (not a
+    mathematical proof for the implemented env).
 
     Runs the ENV under the canonical cost (penalty_at_retailer_only=True) and shows:
       (1) the env canonical cost is UNIMODAL in a uniform base-stock (single global basin) -> the
-          numerically-optimized env oracle is the GLOBAL optimum of the base-stock class. With
-          Clark-Scarf (1960) (base-stock is THE optimal policy class for the canonical serial
-          model) that makes it the PROVABLE optimum, not just a good heuristic.
-      (2) the env oracle's cost MATCHES the idealized provably-convex model (optimize_canonical_
-          serial) in magnitude -> an independent cross-check (differences = the env's extra
-          manufacturer production lead + the equilibrium-init transient over the finite horizon).
+          numerically-optimized env oracle is the global optimum of the base-stock class WITHIN this
+          search. Clark-Scarf (1960) establishes that base-stock is the optimal policy CLASS for the
+          canonical serial model; the EXACT optimum is verified only for the single stage by
+          scripts/dp_optimum.py (the multi-echelon finite-horizon env here is validated, not proven).
+      (2) the env oracle's cost MATCHES the idealized convex single-installation model
+          (optimize_canonical_serial) in magnitude -> an independent cross-check (differences = the
+          env's extra manufacturer production lead + the equilibrium-init transient).
 
-    After this you may write: "DRACO recovers X% of the gap to the provably optimal base-stock
-    (Clark-Scarf 1960)" -- the strongest version of the C1 claim. Returns the per-lambda rows."""
+    After this, the defensible claim is: "DRACO recovers X% of the gap to the validated-optimal
+    base-stock ceiling (Clark-Scarf 1960 policy class; exact single-stage check via dp_optimum.py)."
+    Returns the per-lambda rows."""
     lambdas = [float(l) for l in (HELDOUT_LAMBDAS if lambdas is None else lambdas)]
     base_cfg = dict(ENV_BASE if env_cfg is None else env_cfg)
     cfg_canon = {**base_cfg, "penalty_at_retailer_only": True}          # << canonical cost ON the env
@@ -643,9 +646,10 @@ def validate_canonical(lambdas=None, L=4, select_episodes=60, eval_episodes=120,
     if verbose:
         print("-" * 90)
         print(f"  single global basin at every lambda: {all_unimodal}  -> the env canonical oracle "
-              f"is the GLOBAL optimum of the base-stock class.")
-        print(f"  Clark-Scarf (1960): base-stock is optimal for the canonical serial model => this is "
-              f"the PROVABLE optimum.")
+              f"is the global optimum of the base-stock class within this search.")
+        print(f"  Clark-Scarf (1960): base-stock is the optimal policy CLASS for the canonical serial "
+              f"model. This is a VALIDATED computational ceiling, not a proof for the finite-horizon")
+        print(f"  multi-echelon env (exact optimum proven only for the single stage: scripts/dp_optimum.py).")
         print(f"  env/ideal ~1 cross-checks the magnitude (gap = mfr production lead + finite-horizon "
               f"equilibrium-init transient).")
     return rows
@@ -816,6 +820,8 @@ def regime_benchmark(lambdas=None, select_episodes=80, eval_episodes=200, env_cf
         for name in ("BAR_static", "Adaptive", "Bayes", "Oracle"):
             row = "".join(f"{rungs[name][l]:>12.1f}" for l in lambdas)
             print(f"  {name:<14}{row}{means[name]:>12.1f}")
+        print("  (Oracle = per-lambda best static base-stock = a validated ceiling; a PROVEN optimum "
+              "only under the canonical cost. Adaptive/Bayes are naive-adaptation floors -- bullwhip, S2.)")
         print(f"\n  Headroom DRACO must capture (BAR-Oracle) = {means['BAR_static'] - means['Oracle']:.1f}")
         print(f"  Bayes - BAR = {means['Bayes'] - means['BAR_static']:+.1f}  "
               f"(>0 = naive adaptation BULLWHIPS above the static bar; expected in the per-stage cost)")

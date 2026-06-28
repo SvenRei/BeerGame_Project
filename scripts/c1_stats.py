@@ -191,6 +191,29 @@ def compare_many(named_pvals, method="holm"):
             for i, n in enumerate(names)}
 
 
+def tost(diffs, low, high, alpha=0.05):
+    """Two One-Sided Tests for EQUIVALENCE (review #9, the communication NULL): is the mean of the
+    paired differences `diffs` (e.g. no_comm_cost - topology_cost, per seed) within the band
+    [low, high] (= +/- delta)? Returns dict(mean, p_tost, equivalent, ...). Equivalent iff BOTH
+    one-sided tests reject, i.e. p_tost = max(p_low, p_high) < alpha. Requires scipy for the t-tests."""
+    d = np.asarray(diffs, float)
+    n = int(d.size)
+    out = {"n": n, "mean": float(np.mean(d)) if n else float("nan"),
+           "low": float(low), "high": float(high), "p_tost": float("nan"), "equivalent": False}
+    if n < 2:
+        return out
+    try:
+        from scipy import stats
+        p_low = float(stats.ttest_1samp(d, low, alternative="greater").pvalue)   # H0: mean <= low
+        p_high = float(stats.ttest_1samp(d, high, alternative="less").pvalue)    # H0: mean >= high
+        out["p_low"], out["p_high"] = p_low, p_high
+        out["p_tost"] = max(p_low, p_high)
+        out["equivalent"] = bool(out["p_tost"] < alpha)
+    except Exception:
+        pass
+    return out
+
+
 # ==============================================================================
 # The C1 report
 # ==============================================================================
@@ -291,8 +314,10 @@ def print_report(rep):
         return f"[{t[0]:.1f}, {t[1]:.1f}]"
 
     print(f"  DRACO mean cost     : {a['draco_cost_mean']:.1f}  95% CI {_ci1(a['draco_cost_ci'])}")
-    print(f"  references          : BAR(static)={a['bar']:.1f}   Oracle={a['oracle']:.1f}"
+    print(f"  references          : BAR(static)={a['bar']:.1f}   BestStatic(per-lam)={a['oracle']:.1f}"
           + (f"   Bayes={a['bayes']:.1f}" if a['bayes'] is not None else "   Bayes=n/a"))
+    print(f"  (BestStatic = per-lambda best static base-stock; a validated ceiling -- a PROVEN optimum "
+          f"only under the canonical cost / dp_optimum.py, not the default all-echelon cost.)")
     print("-" * 78)
     flag = "PASS (excludes 0)" if a["gap_ci_excludes_0"] else "NOT SIGNIFICANT (CI includes 0)"
     print(f"  Gap_Recovered       : {a['gap_mean']:+.3f}  95% CI {_ci(a['gap_ci'])}   -> {flag}")
@@ -322,7 +347,7 @@ def print_report(rep):
     print(f"  per-lambda:")
     hdr = f"    {'lambda':>7}{'DRACO':>10}{'95% CI':>17}{'BAR':>8}"
     hdr += f"{'Bayes':>8}" if rep["has_bayes"] else ""
-    hdr += f"{'Oracle':>8}{'Gap':>8}{'Gap CI':>16}{'<=1':>5}"
+    hdr += f"{'BestStat':>8}{'Gap':>8}{'Gap CI':>16}{'<=1':>5}"
     print(hdr)
     for l in rep["lambdas"]:
         r = rep["per_lambda"][l]
@@ -338,9 +363,12 @@ def print_report(rep):
 
 
 def load_draco_dir(draco_dir):
-    """Load results/draco_c1/seed{S}.json files -> {seed: {lambda: cost}}."""
+    """Load results/draco_c1/seed{S}.json files -> {seed: {lambda: cost}}. Skips the sibling
+    seed{S}_bw.json bullwhip dumps (read separately by run_confirmatory_report)."""
     out = {}
     for p in sorted(glob.glob(os.path.join(draco_dir, "seed*.json"))):
+        if p.endswith("_bw.json"):
+            continue
         base = os.path.basename(p)
         try:
             s = int("".join(ch for ch in base.split("seed")[1] if ch.isdigit()))
@@ -431,6 +459,13 @@ def _selftest():
     cm = compare_many({"a": 0.001, "b": 0.20}, "holm")
     assert cm["a"]["reject"] and not cm["b"]["reject"]
     print("  F) multiple-comparison (Holm/BH) correction  PASS")
+
+    # G) TOST equivalence: tight-around-0 diffs are equivalent within +/-1; far-from-0 are not.
+    rng2 = np.random.default_rng(3)
+    eq = tost(rng2.normal(0.0, 0.2, size=30), -1.0, 1.0)
+    neq = tost(rng2.normal(5.0, 0.2, size=30), -1.0, 1.0)
+    assert eq["equivalent"] is True and neq["equivalent"] is False, (eq, neq)
+    print("  G) TOST equivalence test  PASS")
     print("\nc1_stats self-test PASS")
 
 

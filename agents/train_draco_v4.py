@@ -121,7 +121,30 @@ def main(cfg: DictConfig):
     #     `python baselines.py regime`. Watch Eval_lambda/Gap_Recovered: >=0 beats the bar
     #     (C1 exists), 1.0 == oracle, <0 == no regime inference. Envs are built ONCE here. ---
     heldout_lams   = list(cfg.agent.get("heldout_lambdas", HELDOUT_LAMBDAS))  # val split (Phase1) vs test split (Phase2)
-    heldout_envs   = make_heldout_envs(DemandRandomizedBeerGame, env_cfg, heldout_lams)
+    # LEAKAGE GUARD: the checkpoint/early-stop gate keys off heldout_lams. HELDOUT_LAMBDAS is the C1
+    # TEST set; checkpointing on it leaks the headline. Default config uses the val split; warn loudly
+    # if a run gates on test lambdas without explicitly acknowledging it.
+    if (set(float(x) for x in heldout_lams) & set(float(x) for x in HELDOUT_LAMBDAS)
+            and not bool(cfg.agent.get("allow_test_gate", False))):
+        print("[draco-v4] WARNING: checkpointing on C1 TEST lambdas "
+              f"{[l for l in heldout_lams if float(l) in set(map(float, HELDOUT_LAMBDAS))]} -> TEST-SET "
+              "LEAKAGE. Use the validation split (agent.heldout_lambdas=[8,12,16,20]) for selection, "
+              "or set agent.allow_test_gate=true to acknowledge.", flush=True)
+    # The checkpoint/early-stop gate. Default = stationary Poisson held-out lambdas. For the AR(1)
+    # communication study (Phase 3b), the selection target should MATCH the study objective, so
+    # heldout_mode=ar1 gates on held-out AR(1) regimes at VALIDATION rho (disjoint from the test rho).
+    heldout_mode = str(cfg.agent.get("heldout_mode", "poisson")).lower()
+    if heldout_mode == "ar1":
+        from scripts.demand_families import make_demand_family_envs, make_ar1_rho_envs
+        _AR1cls, _, _ = make_demand_family_envs(BeerGameParallelEnv)
+        _val_rhos = [float(r) for r in cfg.agent.get("heldout_ar1_rhos", [0.15, 0.45, 0.75])]
+        heldout_envs = make_ar1_rho_envs(_AR1cls, env_cfg, rhos=_val_rhos,
+                                         mu=float(cfg.agent.get("ar1_mu_hi", 12.0)),
+                                         sigma=float(cfg.agent.get("ar1_sigma", 3.0)))
+        print(f"[draco-v4] held-out gate = AR(1) at validation rho {_val_rhos} (Mean_Cost selection; "
+              f"Gap_Recovered is N/A here -- ignore it, like Phase 1).", flush=True)
+    else:
+        heldout_envs = make_heldout_envs(DemandRandomizedBeerGame, env_cfg, heldout_lams)
     heldout_every  = cfg.agent.get("heldout_every", 200)
     heldout_eps    = cfg.agent.get("heldout_episodes", 20)
     # References (BAR / Oracle / Bayes) come from the FOUR-rung ladder written by

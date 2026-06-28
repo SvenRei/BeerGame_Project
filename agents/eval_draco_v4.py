@@ -361,18 +361,23 @@ def dump_c1(ckpt, episodes, out_dir, lambdas=HELDOUT_LAMBDAS, seed=None):
     Run this once per Phase-2 checkpoint, then `python scripts/c1_stats.py report`."""
     if seed is None:
         seed = ckpt.get("config", {}).get("seed", 0)
-    per = {}
+    per, per_bw = {}, {}
     for lam in lambdas:
         env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
                                        lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
         pol = DracoV4Policy(ckpt, env, ablate=False)
-        costs = [run_episode(pol, env, HELDOUT_SEED_BASE + e)["cost"] for e in range(episodes)]
-        per[float(lam)] = float(np.mean(costs))
+        rs = [run_episode(pol, env, HELDOUT_SEED_BASE + e) for e in range(episodes)]
+        per[float(lam)] = float(np.mean([r["cost"] for r in rs]))
+        # per-echelon cumulative bullwhip BW_cum = Var(orders)/Var(customer demand), avg over episodes
+        per_bw[float(lam)] = {a: float(np.nanmean([r["bw_cum"][a] for r in rs])) for a in AGENTS}
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"seed{int(seed)}.json")
     with open(path, "w") as f:
         json.dump(per, f, indent=2)
-    print(f"\n  [dump-c1] wrote {path}")
+    bw_path = os.path.join(out_dir, f"seed{int(seed)}_bw.json")          # consumed by run_confirmatory_report
+    with open(bw_path, "w") as f:
+        json.dump(per_bw, f, indent=2)
+    print(f"\n  [dump-c1] wrote {path} (+ {os.path.basename(bw_path)})")
     print(f"    lambdas {[f'{l:g}' for l in lambdas]}  mean_cost "
           f"{[round(per[float(l)],1) for l in lambdas]}  ({episodes} eps/lambda)")
     return path
@@ -461,6 +466,45 @@ def bullwhip_comparison(ckpt, episodes=40, lambdas=HELDOUT_LAMBDAS, refs_json=No
     print("    (static base-stock is ~bullwhip-free [BW~1]; the Bayes floor amplifies upstream; the")
     print("     S2 claim is that DRACO adapts the regime while keeping BW_cum low -> 'adapt without bullwhip'.)")
     return rows
+
+
+def action_diagnostics(ckpt, episodes=20, lambdas=(8.0, 22.0)):
+    """Saturation/clipping diagnostics for the continuous-S -> order = clip(S - IP, 0, max_order)
+    -> round map (review #11). There is NO policy-gradient bias (the Gaussian action IS S; the clip
+    and round are deterministic ENV transforms downstream), but heavy saturation flattens gradients
+    and is worth monitoring. Reports, per echelon: fraction of steps clipped at 0 (desired S <= IP),
+    fraction at the order cap, and the desired-order (S - IP) distribution. Low+high lambda surface
+    over-stock (clip@0) vs cap-binding (at-cap)."""
+    mo = float(ENV_BASE["max_order"])
+    print(f"\n  action saturation diagnostics  ({episodes} eps/lambda, lambdas {[f'{l:g}' for l in lambdas]})")
+    print(f"    {'echelon':<13}{'clip@0 %':>10}{'at-cap %':>10}{'desire p10':>11}{'desire med':>11}{'desire p90':>11}")
+    agg = {a: [] for a in AGENTS}
+    for lam in lambdas:
+        env = DemandRandomizedBeerGame({**ENV_BASE, "demand_type": "poisson"},
+                                       lam_lo=float(lam), lam_hi=float(lam), p_shift=0.0)
+        pol = DracoV4Policy(ckpt, env, ablate=False)
+        for e in range(episodes):
+            obs, _ = env.reset(seed=HELDOUT_SEED_BASE + e)
+            pol.reset()
+            while True:
+                acts = pol.act(obs)                                 # sets pol.last_S
+                for i, a in enumerate(AGENTS):
+                    o = obs[a]; ip = float(o[0]) - float(o[1]) + float(o[2])
+                    agg[a].append(float(pol.last_S[i]) - ip)        # desired order S - IP (pre-clip)
+                obs, _, _, trunc, _ = env.step({a: [acts[a]] for a in AGENTS})
+                if any(trunc.values()):
+                    break
+    out = {}
+    for a in AGENTS:
+        d = np.asarray(agg[a], float)
+        clip0, cap = float(np.mean(d <= 0.0)), float(np.mean(d >= mo))
+        out[a] = {"clip0_frac": clip0, "cap_frac": cap, "p10": float(np.percentile(d, 10)),
+                  "median": float(np.median(d)), "p90": float(np.percentile(d, 90))}
+        print(f"    {a:<13}{100*clip0:>10.1f}{100*cap:>10.1f}{out[a]['p10']:>11.1f}"
+              f"{out[a]['median']:>11.1f}{out[a]['p90']:>11.1f}")
+    print("    (high clip@0 = often over-stocked/idle; high at-cap = demand exceeds the order cap -> "
+          "raise max_order or check saturation. No PG bias -- S is the sampled action.)")
+    return out
 
 
 def heldout_family_eval(ckpt, episodes=50, mu=12.0, ar1_rhos=(0.0, 0.3, 0.6, 0.9), nb_disps=(2.0, 4.0, 8.0)):
@@ -803,6 +847,8 @@ def main():
     ap.add_argument("--bullwhip", action="store_true",
                     help="bullwhip comparison (review #13): order-variance amplification DRACO vs static vs Bayes")
     ap.add_argument("--bullwhip-episodes", type=int, default=40)
+    ap.add_argument("--action-diag", action="store_true",
+                    help="action saturation diagnostics (review #11): clip@0 / at-cap / desired-order distribution")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location=DEVICE, weights_only=False)
@@ -896,6 +942,10 @@ def main():
     # ---- bullwhip comparison (review #13: the 'adapt without bullwhip' S2 story) ----
     if args.bullwhip or args.full:
         bullwhip_comparison(ckpt, episodes=args.bullwhip_episodes, refs_json=refs_path)
+
+    # ---- action saturation diagnostics (review #11) ----
+    if args.action_diag or args.full:
+        action_diagnostics(ckpt, episodes=max(5, args.bullwhip_episodes // 2))
 
     # ---- message analysis (Study 2) ----
     if args.messages or args.full:

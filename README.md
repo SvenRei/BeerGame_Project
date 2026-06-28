@@ -67,7 +67,8 @@ Generated at runtime (git-ignored): `weights_draco/` (checkpoints), `results/` (
   observes only 4 local scalars `[inventory, backlog, on_order, last_demand]`; a centralized critic
   sees the full pipeline during training only (CTDE). Per-period cost is `h·inventory + b·backlog`
   at every echelon by default (the behavioral beer-game team cost), or retailer-only with
-  `env.penalty_at_retailer_only=true` (the canonical Clark–Scarf cost, which has a provable optimum).
+  `env.penalty_at_retailer_only=true` (the canonical Clark–Scarf cost, whose optimal policy *class* is
+  base-stock; the exact optimum is verified for the single stage in `scripts/dp_optimum.py`).
 - **Belief (BAMDP)** — a causal, action-free encoder (GRU or CRAFT transformer) maps the observation
   history to a latent `z`, trained by a self-supervised demand-reconstruction ELBO so `z` encodes the
   demand regime. `z` is detached for the policy/critic (the encoder is a clean forecaster).
@@ -125,10 +126,12 @@ regenerate it per run. (`set WANDB_MODE=disabled` / `export WANDB_MODE=disabled`
 # 1) BENCHMARK (once): the 4-rung ladder -> results/baselines_regime_v2.json
 python scripts/baselines.py regime --lambdas 6 10 14 18 22 --select-episodes 80 --eval-episodes 200
 
-# 2) TRAIN (the trainer auto-loads the refs above; logs Gap vs BAR/Oracle/Bayes)
+# 2) TRAIN (default checkpoint gate = VALIDATION lambdas [8,12,16,20] -> leakage-safe; refs auto-loaded)
 python agents/train_draco_v4.py agent=draco_v4 agent.actor_head=structured agent.use_comm=false \
        agent.demand_aux_coef=0.3 agent.z_dim=8 agent.encoder_type=gru \
        total_episodes=15000 seed=10 agent.algorithm=c1_s10
+#   The C1 TEST lambdas {6,10,14,18,22} are scored POST-HOC in step 4 (never the selection gate).
+#   Gating on them warns about leakage unless you set agent.allow_test_gate=true.
 
 # 3) EVAL a checkpoint (standard benchmark + C1 table + held-out families + bullwhip comparison)
 python agents/eval_draco_v4.py --ckpt weights_draco/run_dracov4_<id>/draco_checkpoint_best.pt \
@@ -142,8 +145,9 @@ python scripts/c1_stats.py report --draco-dir results/draco_c1 --refs results/ba
 python scripts/distill_symbolic.py --ckpt <ckpt> --backend pysr --dagger-rounds 4
 ```
 
-For the statistical headline, train ≥5 (ideally ≥10) seeds (loop `seed=10..14`), `--dump-c1` each,
-then run `c1_stats report` over all of them.
+For the statistical headline, train **≥10 seeds** (loop `seed=10..19`; 5 is a *pilot* only — the
+nonparametric p is floored ≈0.06 at n=5), `--dump-c1` each, then run `c1_stats report` (or the
+locked `scripts/run_confirmatory_report.py`) over all of them.
 
 ### Sweeps
 `phase{1,2,3,3b}_sweep.sh` are GPU-host scripts that run the multi-config / multi-seed studies; each
@@ -190,10 +194,11 @@ bash smoke_test.sh                     # everything, tiny settings
 
 Read these before reporting numbers — they shape what the results mean.
 
-- **Cost model vs. optimality.** The default cost penalizes backlog at *every* echelon, so the
-  reported "oracle" is a numerically-optimized static base-stock, **not** a provable optimum. For a
-  provable ceiling, use `env.penalty_at_retailer_only=true` (canonical Clark–Scarf cost) and validate
-  with `python scripts/baselines.py validate-canonical`.
+- **Cost model vs. optimality.** The default cost penalizes backlog at *every* echelon, so the ceiling
+  rung is the **per-λ best static base-stock** (a *validated computational ceiling*), **not** a proven
+  optimum — report it as "best static base-stock," not "oracle," in this setting. For a verified
+  optimum use `env.penalty_at_retailer_only=true` (canonical Clark–Scarf cost) + `baselines.py
+  validate-canonical`, with the exact single-stage optimum in `scripts/dp_optimum.py`.
 - **Adaptation induces bullwhip.** Under the penalty-at-every-stage cost, a static base-stock is
   ~bullwhip-free, while *any* adaptive policy (Bayes, EWMA, and a naïve DRACO) injects order variance
   that is costly upstream. Empirically the static base-stock beats the adaptive comparators; the
